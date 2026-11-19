@@ -1,3 +1,4 @@
+<img width="1254" height="1254" alt="clipfyLOGO" src="https://github.com/user-attachments/assets/3c0f6b4f-dd40-4a3d-a623-15e2b6229be2" />
 # LIVE-CLIPPER
 # 🌴 Clipador — Automatic Live Clipper
 
