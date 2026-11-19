@@ -1,10 +1,10 @@
+## 📋 Requirements
+
 Before running the project, make sure you have installed:
 
-Python 3.8 or newer.
-FFmpeg.
-Streamlink.
-yt-dlp (for processing videos from URLs).
-Install FFmpeg
-Windows:
+- Python 3.8 or newer.
+- FFmpeg.
+- Streamlink.
+- yt-dlp (for processing videos from URLs).
 
-winget install ffmpeg
+### Install FFmpeg
