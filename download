@@ -1,0 +1,1422 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+CLIPFY - CLIPADOR AUTOMÁTICO DE LIVES
+Grava lives (Twitch, YouTube, Kick...), detecta picos de áudio e de chat,
+corta os clipes sozinho e salva o arquivo completo da live no seu PC.
+
+Requisitos: Python 3.8+, streamlink e ffmpeg instalados.
+    pip install streamlink
+    (ffmpeg: https://ffmpeg.org/download.html  ou  winget install ffmpeg)
+Uso: python clipfy.py   -> abre o painel em http://localhost:8765
+"""
+import base64, hashlib, hmac, json, math, os, re, secrets, shutil, socket, struct, subprocess, sys, threading, time, webbrowser
+import urllib.error, urllib.request
+from array import array
+from collections import deque
+from datetime import date, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CFG_FILE = os.path.join(HERE, "config.json")
+USERS_FILE = os.path.join(HERE, "users.json")
+PORT = 8765
+NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+DEFAULT = {
+    "outdir": os.path.join(os.path.expanduser("~"), "Clipador"),
+    "channels": [],
+    "pre": 20, "post": 10, "sens": 6, "cooldown": 45,
+    "vertical": False, "chat": True, "keep_ts": False, "mode": "both", "floor": 400, "minscore": 45, "sustain": 3, "rename": "meta", "apikey": "", "aimodel": "claude-haiku-5-5",
+    "signup_open": True, "signup_limit": 10, "signup_channels": 2, "gh_id": "", "gh_secret": "",
+}
+CTX = threading.local()          # usuário "atual" de cada thread
+USERS, SESS, OAUTH = {}, {}, {}
+ULOCK = threading.Lock()
+USER_KEYS = {"pre", "post", "sens", "cooldown", "vertical", "chat", "keep_ts", "mode", "floor",
+             "minscore", "sustain", "rename", "apikey", "aimodel"}
+
+
+ADMIN_NAME = "rafael_22"          # único administrador do sistema
+ADMIN_EMAIL = "rafaeldhe319@gmail.com"   # e-mail da conta de administrador (tokens ilimitados)
+RESERVED = {"admin", "administrador", "administrator", "root", "suporte", "support", "moderador"}
+
+
+def nick_key(n):
+    """Normaliza para pegar imitações: Rafael.22 / rafael-22 / rafael22 => rafael22"""
+    return re.sub(r"[_.\-]", "", str(n).lower())
+
+
+def reserved(n):
+    return nick_key(n) == nick_key(ADMIN_NAME) or str(n).lower() in RESERVED
+
+
+class _Cfg(dict):
+    """Config global; as opções de USER_KEYS são resolvidas por usuário (thread atual)."""
+    def _uc(self, k):
+        u = getattr(CTX, "user", None)
+        return USERS[u].get("cfg", {}) if u in USERS and k in USER_KEYS else {}
+
+    def __getitem__(self, k):
+        c = self._uc(k)
+        return c[k] if k in c else dict.__getitem__(self, k)
+
+    def get(self, k, d=None):
+        try:
+            return self[k]
+        except KeyError:
+            return d
+
+    def __setitem__(self, k, v):
+        u = getattr(CTX, "user", None)
+        if u in USERS and k in USER_KEYS:
+            USERS[u].setdefault("cfg", {})[k] = v
+        else:
+            dict.__setitem__(self, k, v)
+
+
+CFG = _Cfg(DEFAULT)
+if os.path.exists(CFG_FILE):
+    try:
+        CFG.update(json.load(open(CFG_FILE, encoding="utf-8")))
+    except Exception:
+        pass
+LOCK = threading.Lock()
+
+
+def save_cfg():
+    with LOCK:
+        json.dump(CFG, open(CFG_FILE, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+
+
+def load_users():
+    try:
+        USERS.update(json.load(open(USERS_FILE, encoding="utf-8")))
+    except Exception:
+        pass
+    if ADMIN_NAME not in USERS:  # conta de admin criada antes com outro nome vira rafael_22
+        old = next((k for k, r in USERS.items() if r.get("role") == "admin"), None)
+        if old:
+            USERS[ADMIN_NAME] = USERS.pop(old)
+            for sub in ("Biblioteca", "Lives", "Videos"):
+                a, b = (os.path.join(CFG["outdir"], sub, x) for x in (old, ADMIN_NAME))
+                if os.path.isdir(a) and not os.path.exists(b):
+                    try:
+                        os.rename(a, b)
+                    except Exception:
+                        pass
+            print(f"Conta de administrador '{old}' agora é '{ADMIN_NAME}'.")
+    for k, r in USERS.items():
+        if k == ADMIN_NAME:
+            r["role"] = "admin"
+        else:
+            r.setdefault("role", "user")
+        if k != ADMIN_NAME and reserved(k):
+            r["active"] = False
+    if ADMIN_NAME in USERS:  # liga o e-mail ao administrador; conta comum antiga com esse e-mail é incorporada
+        adm = USERS[ADMIN_NAME]
+        adm.update(email=ADMIN_EMAIL, display=ADMIN_NAME)
+        for k, r in USERS.items():
+            if k != ADMIN_NAME and r.get("email", "").lower() == ADMIN_EMAIL.lower():
+                adm["channels"] += [u for u in r.get("channels", []) if u not in adm["channels"]]
+                r.update(active=False, email="", channels=[])
+                print(f"A conta '{k}' usava o e-mail do administrador e foi desativada (canais passados para {ADMIN_NAME}).")
+    save_users()
+
+
+def save_users():
+    with ULOCK:
+        json.dump(USERS, open(USERS_FILE, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+
+
+def hpw(pw, salt):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+def new_user(name, pw, role="user", limit=30, maxch=3):
+    salt = secrets.token_hex(16)
+    USERS[name] = {"salt": salt, "hash": hpw(pw, salt), "role": role, "limit": limit, "max_channels": maxch,
+                   "active": True, "used": {"d": str(date.today()), "n": 0}, "channels": [], "cfg": {}, "created": time.time()}
+
+
+def is_owner(u):
+    return u == ADMIN_NAME and u in USERS
+
+
+def is_admin(u):
+    return USERS.get(u, {}).get("role") == "admin"
+
+
+def tokens_left(u):
+    """Tokens que sobram hoje (None = ilimitado). Renova à meia-noite."""
+    r = USERS.get(u)
+    if not r:
+        return 0
+    if r["role"] == "admin":
+        return None
+    if r["used"]["d"] != str(date.today()):
+        r["used"] = {"d": str(date.today()), "n": 0}
+    return max(r["limit"] - r["used"]["n"], 0)
+
+
+def can_clip(u):
+    left = tokens_left(u)
+    return left is None or left > 0
+
+
+def spend(u, n=1):
+    r = USERS.get(u)
+    if r and r["role"] != "admin":
+        tokens_left(u)
+        r["used"]["n"] += n
+        save_users()
+
+
+def can_access(rel, u):
+    return is_owner(u) or rel.replace("\\", "/").startswith(f"Biblioteca/{u}/")
+
+
+def owner_of(p, base):
+    parts = os.path.relpath(p, base).replace("\\", "/").split("/")
+    return parts[1] if parts[0] == "Biblioteca" and len(parts) > 3 else None
+
+
+def user_file(rel, u):
+    base = os.path.realpath(CFG["outdir"])
+    p = os.path.realpath(os.path.join(base, rel or ""))
+    rp = os.path.relpath(p, base).replace("\\", "/")
+    return p if p.startswith(base + os.sep) and p.endswith(".mp4") and os.path.isfile(p) and can_access(rp, u) else None
+
+
+def me_info(u):
+    d = {"setup": ADMIN_NAME not in USERS, "user": u, "gh": bool(CFG["gh_id"] and CFG["gh_secret"]),
+         "signup": bool(CFG["signup_open"]) and ADMIN_NAME in USERS}
+    if u:
+        r, adm = USERS[u], is_admin(u)
+        d.update(owner=u == ADMIN_NAME, display=r.get("display") or r.get("email") or u, role=r["role"], left=tokens_left(u), limit=None if adm else r["limit"],
+                 max_channels=None if adm else r["max_channels"],
+                 channels=sum(1 for m in MON.values() if m.owner == u))
+    return d
+
+
+def find_user(ident):
+    ident = str(ident).strip().lower()
+    if ident == ADMIN_EMAIL.lower() and ADMIN_NAME in USERS:
+        return ADMIN_NAME
+    if "@" in ident:
+        return next((k for k, r in USERS.items() if r.get("email", "").lower() == ident), None)
+    return ident if ident in USERS else None
+
+
+def make_key(email):
+    base = re.sub(r"[^a-z0-9_.-]", "", email.split("@")[0].lower())[:12] or "user"
+    h = hashlib.sha1(email.encode()).hexdigest()
+    n = 4
+    while f"{base}_{h[:n]}" in USERS or reserved(f"{base}_{h[:n]}"):
+        n += 2
+    return f"{base}_{h[:n]}"
+
+
+def oauth_user(prefix, ident, email):
+    if str(email).lower() == ADMIN_EMAIL.lower():
+        email = ""
+    ident = re.sub(r"[^a-z0-9-]", "", str(ident).lower())
+    if not ident:
+        return None
+    key = f"{prefix}_{ident}"[:34]
+    if key not in USERS:
+        if not CFG["signup_open"]:
+            return None
+        new_user(key, secrets.token_urlsafe(24), "user", int(CFG["signup_limit"]), int(CFG["signup_channels"]))
+        USERS[key].update(email=email or "", display="@" + ident, provider=prefix)
+        save_users()
+    return key if USERS[key].get("active", True) else None
+
+
+def chan_name(url):
+    return url.rstrip("/").split("/")[-1].split("?")[0] or "live"
+
+
+def find_streamlink():
+    if shutil.which("streamlink"):
+        return ["streamlink"]
+    try:
+        r = subprocess.run([sys.executable, "-m", "streamlink", "--version"], capture_output=True,
+                           creationflags=NOWIN)
+        if r.returncode == 0:
+            return [sys.executable, "-m", "streamlink"]
+    except Exception:
+        pass
+    return None
+
+
+SL = find_streamlink()
+
+
+
+
+
+def analyze(vol, chat):
+    """Nota do clipe: volume (pico, média) e onde o chat disparou."""
+    if not vol:
+        return {}
+    n = len(vol)
+    vp = max(vol); vt = vol.index(vp); va = sum(vol) / n
+    chat = list(chat)[:n]
+    c5 = [sum(chat[i:i + 5]) for i in range(max(len(chat) - 4, 1))] if chat else [0]
+    cm = max(c5); ctt = c5.index(cm) + 2 if cm else 0
+    step = max(1, n // 60)
+    wave = [round(max(vol[i:i + step])) for i in range(0, n, step)]
+    cw = [sum(chat[i:i + step]) for i in range(0, len(chat), step)] if chat else []
+    score = round(min(vp / max(va, 1) / 4, 1) * 60 + min(cm / 20, 1) * 40) if cm else round(min(vp / max(va, 1) / 3, 1) * 100)
+    return {"vp": round(vp), "va": round(va), "vt": vt, "vi": min(vt // step, len(wave) - 1), "cm": cm, "ct": sum(chat),
+            "ctt": ctt, "ci": min(ctt // step, max(len(cw) - 1, 0)), "wave": wave, "cw": cw, "score": score}
+
+
+def make_clip(src, start, dur, folder, reason, vol, chat, reencode=False):
+    d = os.path.join(CFG["outdir"], "Biblioteca", getattr(CTX, "user", None) or "_", folder)
+    os.makedirs(d, exist_ok=True)
+    out = os.path.join(d, f"clipe_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}.mp4")
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(start), "-i", src, "-t", str(dur)]
+    if CFG["vertical"]:
+        vf = ("split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
+              "[b]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2")
+        cmd += ["-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-c:a", "aac"]
+    elif reencode:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-c:a", "aac"]
+    else:
+        cmd += ["-c", "copy"]
+    r = run(cmd + ["-movflags", "+faststart", out], capture_output=True)
+    if r.returncode != 0 or not os.path.exists(out):
+        return None
+    info = {"file": out, "rel": os.path.relpath(out, CFG["outdir"]).replace("\\", "/"), "name": os.path.basename(out),
+            "reason": reason, "at": datetime.now().strftime("%H:%M:%S"), "live_t": start, "dur": dur,
+            "stats": analyze(vol[start:start + dur], chat[start:start + dur])}
+    vt = (info["stats"] or {}).get("vt", dur // 2)
+    run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(max(0, min(vt, dur - 1))), "-i", out, "-frames:v", "1",
+         "-vf", "scale=480:-2", out[:-4] + ".jpg"], capture_output=True)
+    json.dump(info, open(out[:-4] + ".json", "w", encoding="utf-8"))
+    return info
+
+
+def low_score(info):
+    """Apaga o clipe e devolve True se a nota ficou abaixo do mínimo configurado."""
+    if info.get("stats", {}).get("score", 100) >= CFG.get("minscore", 0):
+        return False
+    for ext in (".mp4", ".json", ".jpg"):
+        try:
+            os.remove(info["file"][:-4] + ext)
+        except Exception:
+            pass
+    return True
+
+
+AI_ERR = [""]
+
+
+def ai_title(info, game):
+    """Pede à API da Anthropic um título curto olhando 3 quadros do clipe."""
+    st = info.get("stats") or {}
+    vt, dur = st.get("vt", 5), info.get("dur", 30)
+    frames = []
+    for t in (max(0, vt - 3), vt, min(dur - 1, vt + 3)):
+        r = run(["ffmpeg", "-loglevel", "error", "-ss", str(max(0, t)), "-i", info["file"], "-frames:v", "1",
+                 "-vf", "scale=640:-2", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"], capture_output=True)
+        if r.stdout:
+            frames.append(base64.b64encode(r.stdout).decode())
+    if not frames:
+        return None
+    jogo = f" do jogo {game}" if game else ""
+    txt = (f"Estes quadros são de um clipe de uma live{jogo}. Momento detectado: {info.get('reason')}. "
+           "Escreva um título curto em português do Brasil (máximo 7 palavras) dizendo o que acontece na tela, "
+           "no estilo de título de clipe. Responda só com o título, sem aspas e sem pontuação final.")
+    body = {"model": CFG.get("aimodel", "claude-haiku-5-5"), "max_tokens": 60, "messages": [{"role": "user", "content": [
+        *[{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": f}} for f in frames],
+        {"type": "text", "text": txt}]}]}
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages", json.dumps(body).encode(),
+                                 {"x-api-key": CFG["apikey"], "anthropic-version": "2023-06-01",
+                                  "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            j = json.load(r)
+        AI_ERR[0] = ""
+        t = "".join(b.get("text", "") for b in j.get("content", []) if b.get("type") == "text").strip()
+        return t.splitlines()[0] if t else None
+    except urllib.error.HTTPError as e:
+        AI_ERR[0] = f"erro {e.code}: " + e.read().decode("utf-8", "ignore")[:110]
+    except Exception as e:
+        AI_ERR[0] = str(e)[:110]
+    return None
+
+
+def finish_clip(info, meta):
+    """Renomeia o clipe: 'Jogo - momento - nota' ou 'Jogo - título feito pela IA'."""
+    mode = CFG.get("rename", "off")
+    if mode == "off":
+        return info
+    meta = meta or {}
+    game = meta.get("game")
+    title = ai_title(info, game) if mode == "ai" and CFG.get("apikey") else None
+    st = info.get("stats") or {}
+    if title:
+        base = f"{game} - {title}" if game else title
+    else:
+        base = " - ".join(x for x in (game or meta.get("who"), info.get("reason"),
+                                       f"nota {st['score']}" if "score" in st else "") if x)
+    base = re.sub(r'[\\/:*?"<>|\r\n]+', "", base).strip()[:110]
+    if not base:
+        return info
+    d, new, n = os.path.dirname(info["file"]), None, 1
+    new = os.path.join(d, base + ".mp4")
+    while os.path.exists(new):
+        n += 1
+        new = os.path.join(d, f"{base} ({n}).mp4")
+    try:
+        os.rename(info["file"], new)
+        os.rename(info["file"][:-4] + ".json", new[:-4] + ".json")
+        if os.path.exists(info["file"][:-4] + ".jpg"):
+            os.rename(info["file"][:-4] + ".jpg", new[:-4] + ".jpg")
+    except Exception:
+        return info
+    info.update(file=new, name=os.path.basename(new), title=base,
+                rel=os.path.relpath(new, CFG["outdir"]).replace("\\", "/"))
+    json.dump(info, open(new[:-4] + ".json", "w", encoding="utf-8"))
+    return info
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, creationflags=NOWIN, **kw)
+
+
+class Monitor(threading.Thread):
+    def __init__(self, url, owner):
+        super().__init__(daemon=True)
+        self.url, self.name, self.owner = url, chan_name(url), owner
+        self.key = f"{owner}|{url}"
+        self.stop_flag = threading.Event()
+        self.status = "procurando"
+        self.audio = deque(maxlen=120)
+        self.chatH = deque(maxlen=120)
+        self.chat_count = 0
+        self.sec = 0
+        self.last_trig = -999
+        self.clips = []
+        self.live_file = None
+        self.started = None
+        self.procs = []
+        self.log = "Verificando se a live está no ar..."
+        self.err = False
+        self.paused = False
+        self.vall, self.call = [], []
+        self.hot_run = 0
+        self.meta, self.rid = {}, 0
+
+    # ---------- chat (Twitch, IRC anônimo) ----------
+    def chat_loop(self):
+        if "twitch.tv" not in self.url:
+            return
+        while not self.stop_flag.is_set() and self.status == "gravando":
+            try:
+                s = socket.create_connection(("irc.chat.twitch.tv", 6667), timeout=30)
+                s.sendall(f"PASS SCHMOOPIIE\r\nNICK justinfan{int(time.time()) % 99999}\r\nJOIN #{self.name.lower()}\r\n".encode())
+                s.settimeout(30)
+                buf = ""
+                while not self.stop_flag.is_set() and self.status == "gravando":
+                    data = s.recv(4096).decode("utf-8", "ignore")
+                    if not data:
+                        break
+                    buf += data
+                    *lines, buf = buf.split("\r\n")
+                    for ln in lines:
+                        if ln.startswith("PING"):
+                            s.sendall(b"PONG :tmi.twitch.tv\r\n")
+                        elif "PRIVMSG" in ln:
+                            self.chat_count += 1
+            except Exception:
+                time.sleep(5)
+
+    def meta_loop(self, rid):
+        while self.rid == rid and self.status == "gravando" and not self.stop_flag.is_set():
+            try:
+                r = run(SL + ["--json", self.url], capture_output=True, timeout=60)
+                m = json.loads(r.stdout.decode("utf-8", "ignore")).get("metadata") or {}
+                self.meta = {"game": m.get("category"), "who": m.get("author") or self.name, "title": m.get("title")}
+            except Exception:
+                pass
+            self.stop_flag.wait(300)
+
+    # ---------- ciclo principal ----------
+    def is_live(self):
+        if not SL:
+            self.log = "ERRO: streamlink não encontrado. Rode: pip install streamlink"
+            self.err = True
+            return False
+        if not shutil.which("ffmpeg"):
+            self.log = "ERRO: ffmpeg não encontrado. Instale e reabra o terminal."
+            self.err = True
+            return False
+        try:
+            r = run(SL + ["--stream-url", self.url, "best"], capture_output=True, timeout=60)
+        except Exception as e:
+            self.log = f"ERRO ao checar a live: {e}"
+            self.err = True
+            return False
+        if r.returncode == 0:
+            self.err = False
+            return True
+        msg = (r.stderr or r.stdout or b"").decode("utf-8", "ignore").strip().splitlines()
+        last = msg[-1] if msg else ""
+        if "No playable streams" in last or "offline" in last.lower():
+            self.err, self.log = False, "Live offline. Verificando de novo em instantes..."
+        else:
+            self.err, self.log = True, f"Streamlink: {last[:140]}"
+        return False
+
+    def run(self):
+        CTX.user = self.owner
+        while not self.stop_flag.is_set():
+            if self.paused:
+                self.status, self.log = "pausado", "Pausado. Clique em Retomar para voltar a vigiar."
+                self.stop_flag.wait(2)
+                continue
+            self.status = "procurando"
+            if self.is_live():
+                self.record()
+            self.status = ("erro" if self.err else "offline") if not self.stop_flag.is_set() else "parado"
+            self.stop_flag.wait(30)
+
+    def record(self):
+        d = os.path.join(CFG["outdir"], "Lives", self.owner, self.name)
+        os.makedirs(d, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d_%Hh%Mm")
+        self.live_file = os.path.join(d, f"{self.name}_{ts}.ts")
+        self.sec, self.last_trig = 0, -999
+        self.audio.clear(); self.chatH.clear(); self.vall, self.call, self.hot_run = [], [], 0; self.chat_count = 0
+        self.status, self.started = "gravando", time.time()
+        self.log = "Gravando a live e analisando..."
+        try:
+            p1 = subprocess.Popen(SL + ["-O", "--twitch-disable-ads", self.url, "best"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=NOWIN)
+            p2 = subprocess.Popen(["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0",
+                                   "-c", "copy", "-f", "mpegts", self.live_file,
+                                   "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"],
+                                  stdin=p1.stdout, stdout=subprocess.PIPE, creationflags=NOWIN)
+            self.procs = [p1, p2]
+            p1.stdout.close()
+        except Exception as e:
+            self.log = f"Erro ao iniciar: {e}"
+            return
+        self.rid += 1
+        threading.Thread(target=self.meta_loop, args=(self.rid,), daemon=True).start()
+        threading.Thread(target=self.chat_loop, daemon=True).start()
+        buf, size = b"", 16000  # 1 segundo de áudio (8000 amostras * 2 bytes)
+        while not self.stop_flag.is_set() and not self.paused:
+            chunk = p2.stdout.read(size - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) < size:
+                continue
+            n = len(buf) // 2
+            samples = struct.unpack(f"<{n}h", buf[: n * 2])
+            buf = b""
+            rms = math.sqrt(sum(x * x for x in samples) / n)
+            self.tick(rms)
+        self.stop_proc()
+        self.status = "finalizando"
+        self.finalize()
+
+    def stop_proc(self):
+        for p in self.procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+    # ---------- detecção ----------
+    def tick(self, rms):
+        self.sec += 1
+        chat, self.chat_count = self.chat_count, 0
+        self.audio.append(rms); self.chatH.append(chat); self.vall.append(rms); self.call.append(chat)
+        if len(self.audio) < 30:
+            return
+        base = list(self.audio)[:-1][-90:]
+        m = sum(base) / len(base)
+        sd = math.sqrt(sum((x - m) ** 2 for x in base) / len(base))
+        z = (rms - m) / max(sd, m * 0.12, 1)
+        thr = 4.6 - 0.36 * CFG["sens"]
+        reason = None
+        mode = CFG.get("mode", "both")
+        hot = z > thr and rms > CFG.get("floor", 400)
+        self.hot_run = self.hot_run + 1 if hot else 0
+        if mode in ("both", "audio") and self.hot_run >= CFG.get("sustain", 3):
+            reason = "Pico de áudio"
+        if mode in ("both", "chat") and "twitch.tv" in self.url:
+            h = list(self.chatH)
+            c5 = sum(h[-5:])
+            avg5 = (sum(h[:-5]) / max(len(h) - 5, 1)) * 5
+            if c5 >= max(8, avg5 * (2 + (10 - CFG["sens"]) * 0.25)):
+                reason = "Chat explodiu" if not reason else "Áudio + chat"
+        if reason and self.sec - self.last_trig >= CFG["cooldown"]:
+            self.last_trig = self.sec
+            t = threading.Timer(CFG["post"], self.cut, (self.sec, reason)); t.daemon = True; t.start()
+            self.log = f"Momento detectado: {reason}"
+
+    # ---------- corte ----------
+    def cut(self, end_sec, reason, pre=None, post=None):
+        CTX.user = self.owner
+        if not can_clip(self.owner):
+            self.log = "🎟️ Seus tokens de hoje acabaram. Eles renovam à meia-noite."
+            return
+        pre = CFG["pre"] if pre is None else pre
+        post = CFG["post"] if post is None else post
+        start = max(0, end_sec - pre)
+        info = make_clip(self.live_file, start, end_sec - start + post, self.name, reason, self.vall, self.call)
+        if info and reason != "Manual" and low_score(info):
+            self.log = f"Clipe descartado (nota {info['stats'].get('score')} < {CFG['minscore']})"
+            return
+        if info:
+            info = finish_clip(info, self.meta)
+            spend(self.owner)
+            self.clips.append(info)
+            self.log = f"Clipe salvo: {info['name']}"
+
+    def finalize(self):
+        time.sleep(CFG["post"] + 3)
+        if self.live_file and os.path.exists(self.live_file):
+            mp4 = self.live_file[:-3] + ".mp4"
+            r = run(["ffmpeg", "-y", "-loglevel", "error", "-i", self.live_file, "-c", "copy",
+                     "-movflags", "+faststart", mp4], capture_output=True)
+            if r.returncode == 0 and not CFG["keep_ts"]:
+                os.remove(self.live_file)
+            self.log = "Live encerrada. Arquivo completo salvo."
+
+    def snapshot(self):
+        return {"key": self.key, "owner": self.owner, "url": self.url, "name": self.name, "paused": self.paused, "status": self.status, "log": self.log,
+                "audio": [round(x) for x in list(self.audio)[-90:]], "chat": list(self.chatH)[-90:],
+                "clips": self.clips[-30:], "elapsed": int(time.time() - self.started) if self.status == "gravando" else 0,
+                "file": self.live_file}
+
+
+MON = {}
+
+
+def add_channel(url, owner, persist=True):
+    url = url.strip()
+    if not url or owner not in USERS:
+        return "ok"
+    if not url.startswith("http"):
+        url = "https://twitch.tv/" + url
+    key = f"{owner}|{url}"
+    if key in MON:
+        return "ok"
+    if not is_admin(owner) and sum(1 for m in MON.values() if m.owner == owner) >= USERS[owner]["max_channels"]:
+        return "limit"
+    m = Monitor(url, owner)
+    MON[key] = m
+    m.start()
+    if persist and url not in USERS[owner]["channels"]:
+        USERS[owner]["channels"].append(url)
+        save_users()
+    return "ok"
+
+
+def remove_channel(key, u):
+    m = MON.get(key)
+    if m and (m.owner == u or is_owner(u)):
+        MON.pop(key, None)
+        m.stop_flag.set(); m.stop_proc()
+        if m.url in USERS.get(m.owner, {}).get("channels", []):
+            USERS[m.owner]["channels"].remove(m.url)
+            save_users()
+
+
+def start_user(name):
+    for url in USERS[name]["channels"]:
+        add_channel(url, name, False)
+
+
+def stop_user(name):
+    for k in [k for k, m in MON.items() if m.owner == name]:
+        m = MON.pop(k)
+        m.stop_flag.set(); m.stop_proc()
+
+
+def open_path(p):
+    os.makedirs(p, exist_ok=True)
+    if sys.platform.startswith("win"):
+        os.startfile(p)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", p])
+    else:
+        subprocess.Popen(["xdg-open", p])
+
+
+PAGE = r"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Clipfy</title><link rel="icon" href="/favicon.png"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@500;600;700;800&display=swap" rel="stylesheet">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--ac:#ff3d8b;--ac2:#ff9a3c;--ac3:#7c3aed;--bg:#0b0614;--card:#161025;--line:#2f2146;--tx:#f4eefc;--mu:#a493bd}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 520px at 90% -8%,#ff3d8b2e,transparent),radial-gradient(900px 520px at -5% 105%,#7c3aed33,transparent),radial-gradient(700px 400px at 50% 120%,#ff9a3c22,transparent),var(--bg);background-attachment:fixed;color:var(--tx);font:15px/1.5 'Nunito','Varela Round','Segoe UI',system-ui,sans-serif;overflow-x:hidden}
+.orb{position:fixed;border-radius:50%;filter:blur(110px);opacity:.28;z-index:-1;animation:fl 18s ease-in-out infinite alternate}
+.o1{width:520px;height:520px;background:var(--ac);top:-160px;left:-120px}.o2{width:460px;height:460px;background:var(--ac2);bottom:-180px;right:-100px;animation-delay:-7s}
+@keyframes fl{to{transform:translate(90px,60px) scale(1.2)}}
+header{display:flex;align-items:center;gap:16px;padding:22px 32px;flex-wrap:wrap}
+.logo{width:46px;height:46px;border-radius:14px;background:linear-gradient(135deg,var(--ac),var(--ac2));display:grid;place-items:center;font-size:24px;box-shadow:0 0 30px color-mix(in srgb,var(--ac) 55%,transparent);animation:pu 3s infinite}
+@keyframes pu{50%{transform:scale(1.07) rotate(-4deg)}}
+h1{font-size:24px;margin:0;background:linear-gradient(90deg,#fff,var(--ac),var(--ac2));-webkit-background-clip:text;background-clip:text;color:transparent}
+small{color:var(--mu)}.sp{flex:1}
+.stats{display:flex;gap:10px;flex-wrap:wrap}.st{background:#ffffff08;border:1px solid var(--line);border-radius:12px;padding:6px 14px;text-align:center;backdrop-filter:blur(8px)}
+.st b{display:block;font-size:20px;line-height:1.1}.st span{font-size:11px;color:var(--mu);text-transform:uppercase;letter-spacing:.06em}
+.sw{display:flex;gap:6px}.sw i{width:20px;height:20px;border-radius:50%;cursor:pointer;border:2px solid #0000;transition:.2s}.sw i:hover{transform:scale(1.25);border-color:#fff8}
+.tabs{display:flex;gap:6px;padding:0 32px 16px}.tab{padding:8px 18px;border-radius:99px;background:#ffffff08;border:1px solid var(--line);color:var(--mu);cursor:pointer;font-weight:600;transition:.2s}
+.tab.on{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#fff;border-color:#0000;box-shadow:0 6px 24px color-mix(in srgb,var(--ac) 40%,transparent)}
+.wrap{display:grid;grid-template-columns:1fr 330px;gap:22px;padding:0 32px 50px;max-width:1700px;margin:auto}@media(max-width:1050px){.wrap{grid-template-columns:1fr}}
+.card{background:linear-gradient(160deg,#1f1233,var(--card));border:1px solid var(--line);border-radius:18px;padding:18px;transition:.3s}
+.add{display:flex;gap:10px;margin-bottom:18px}
+input[type=text],input[type=number],select{flex:1;background:#0b0b14;border:1px solid var(--line);color:var(--tx);padding:12px 14px;border-radius:12px;font-size:15px;outline:none;width:100%;transition:.2s}
+input:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px color-mix(in srgb,var(--ac) 22%,transparent)}
+button{background:linear-gradient(135deg,var(--ac),var(--ac2));border:0;color:#fff;font-weight:600;padding:10px 16px;border-radius:12px;cursor:pointer;font-size:14px;transition:.2s;white-space:nowrap}
+button:hover{transform:translateY(-2px);filter:brightness(1.12)}button:active{transform:scale(.96)}button:disabled{opacity:.35;pointer-events:none}
+button.g{background:#1c1c2e;border:1px solid var(--line);color:var(--tx)}
+#list{display:grid;grid-template-columns:repeat(auto-fill,minmax(430px,1fr));gap:18px}
+.ch{animation:in .5s both;position:relative;overflow:hidden}@keyframes in{from{opacity:0;transform:translateY(22px) scale(.97)}}
+.ch.rec{border-color:#ff4d6d66;box-shadow:0 0 0 1px #ff4d6d33,0 10px 40px #ff4d6d1f}
+.ch.flash{animation:fs .9s}@keyframes fs{30%{box-shadow:0 0 0 3px var(--ac2),0 0 50px var(--ac2)}}
+.top{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.av{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,var(--ac),var(--ac2));display:grid;place-items:center;font-weight:800;font-size:19px;text-transform:uppercase}
+.name{font-size:18px;font-weight:700;line-height:1.2}
+.badge{padding:3px 10px;border-radius:99px;font-size:11px;font-weight:700;background:#26263c;color:var(--mu);letter-spacing:.05em}
+.badge.gravando{background:#3a1020;color:#ff5c7c}.badge.gravando:before{content:"● ";animation:bl 1s infinite}.badge.erro{background:#4a1a1a;color:#ff8a8a}.badge.pausado{background:#3a3010;color:#ffd166}
+@keyframes bl{50%{opacity:.15}}
+.log{color:var(--mu);font-size:13px;margin:10px 0}
+svg.sp2{width:100%;height:80px;background:#0a0a12;border-radius:12px;display:block}
+.meter{height:6px;background:#0a0a12;border-radius:9px;margin:10px 0 4px;overflow:hidden}.meter i{display:block;height:100%;width:0;background:linear-gradient(90deg,#2ee59d,#facc15,#ff4d6d);transition:width .8s}
+.lab{display:flex;gap:14px;font-size:12px;color:var(--mu);flex-wrap:wrap}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}.chip{background:#0b0b14;border:1px solid var(--line);border-radius:9px;padding:4px 10px;font-size:12px;cursor:pointer;transition:.2s;animation:in .4s}.chip:hover{border-color:var(--ac);transform:translateY(-2px)}
+.empty{text-align:center;color:var(--mu);padding:60px 10px;grid-column:1/-1}.empty b{font-size:40px;display:block;animation:pu 3s infinite}
+aside label{display:block;margin:14px 0 4px;font-size:13px;color:var(--mu)}input[type=range]{width:100%;accent-color:var(--ac)}
+.row{display:flex;justify-content:space-between;align-items:center;margin-top:12px;font-size:14px}
+.seg{display:flex;background:#0b0b14;border:1px solid var(--line);border-radius:12px;padding:3px}.seg b{flex:1;text-align:center;padding:7px 4px;font-size:13px;border-radius:9px;cursor:pointer;color:var(--mu);transition:.2s}.seg b.on{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#fff}
+.tg{width:44px;height:24px;background:#26263c;border-radius:99px;position:relative;cursor:pointer;transition:.25s}.tg:after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.25s}.tg.on{background:var(--ac)}.tg.on:after{left:23px}
+#gal{display:none;grid-column:1/-1}#galg{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:16px;margin-top:14px}
+.gi{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;animation:in .5s both;transition:.25s}.gi:hover{transform:translateY(-4px);border-color:var(--ac)}
+.gi video{width:100%;aspect-ratio:16/9;object-fit:cover;background:#000;display:block;cursor:pointer}.gm{padding:10px 12px;font-size:12px;color:var(--mu);display:flex;justify-content:space-between;gap:8px;align-items:center}.gm b{color:var(--tx);font-size:13px}
+#modal{position:fixed;inset:0;background:#000c;display:none;place-items:center;z-index:50;backdrop-filter:blur(6px)}#modal video{max-width:92vw;max-height:88vh;border-radius:14px;box-shadow:0 0 80px color-mix(in srgb,var(--ac) 50%,transparent)}
+#toasts{position:fixed;right:20px;bottom:20px;display:grid;gap:10px;z-index:60}.toast{background:#171726;border:1px solid var(--ac);border-radius:14px;padding:12px 18px;box-shadow:0 10px 40px #0008;animation:ti .4s,to .4s 4s forwards}
+@keyframes ti{from{transform:translateX(60px);opacity:0}}@keyframes to{to{opacity:0;transform:translateX(60px)}}
+.warn{background:#3a2a10;border:1px solid #6b4a14;color:#ffd58a;padding:12px 16px;border-radius:12px;margin:0 32px 16px}
+.viz{width:100%;height:56px;background:#0a0a12;border-radius:10px;display:block;margin-top:8px}
+.sc{background:linear-gradient(135deg,#ff8a00,#ff3d71);border-radius:99px;padding:2px 9px;font-size:11px;font-weight:700;color:#fff}
+.pbar{height:8px;background:#0a0a12;border-radius:9px;overflow:hidden;margin:8px 0}.pbar i{display:block;height:100%;background:linear-gradient(90deg,var(--ac),var(--ac2),var(--ac));background-size:200%;animation:sh 2s linear infinite;transition:width .6s}@keyframes sh{to{background-position:200% 0}}
+.mb{max-width:92vw}.an{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 16px;margin-top:12px}.an .viz{height:70px;margin:0 0 8px}#jobs{display:grid;gap:16px}
+.vw{position:relative}.star{position:absolute;top:8px;right:8px;background:#000a;border:0;font-size:18px;padding:4px 10px;border-radius:99px;color:#fff}.star.on{box-shadow:0 0 18px #facc15}
+.acts{display:flex;gap:6px;flex-shrink:0}.acts button{padding:7px 10px}
+.o3{width:420px;height:420px;background:var(--ac3);top:40%;left:55%;animation-delay:-12s;opacity:.18}
+#galg{grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:26px 16px}
+.gc{animation:in .5s both}
+.th{position:relative;aspect-ratio:1/1.02;border-radius:16px;overflow:hidden;background:#150c24;cursor:pointer;border:1px solid var(--line);transition:.25s}.gc:hover .th{border-color:var(--ac);box-shadow:0 10px 36px #ff3d8b2e;transform:translateY(-3px)}
+.th .bg{position:absolute;inset:-20px;background-size:cover;background-position:center;filter:blur(22px) brightness(.55) saturate(1.4)}
+.th .fg{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+.th .pl{position:absolute;top:50%;left:50%;width:56px;height:56px;margin:-28px;border-radius:50%;background:#fff;color:#111;display:grid;place-items:center;font-size:20px;opacity:0;transform:scale(.7);transition:.25s}.th:hover .pl{opacity:1;transform:none}
+.th .ov{position:absolute;left:10px;top:10px;display:grid;gap:8px;opacity:0;transform:translateX(-8px);transition:.25s}.th:hover .ov{opacity:1;transform:none}
+.ov button{width:34px;height:34px;padding:0;border-radius:50%;background:#14101fcc;border:1px solid #fff2;font-size:15px;display:grid;place-items:center}.ov button.on{background:linear-gradient(135deg,var(--ac),var(--ac2))}
+.dur{position:absolute;right:10px;bottom:10px;background:#000b;border-radius:8px;padding:2px 8px;font-size:12px;font-weight:700}.dur span{color:#b9a8d4;margin-left:5px;font-weight:600}
+.row2{display:flex;align-items:center;gap:2px;margin-top:10px}
+.big{font-size:30px;font-weight:800;line-height:1;margin-right:8px;background:linear-gradient(90deg,var(--ac),var(--ac2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.ib{background:none;border:0;padding:6px 9px;color:var(--tx);font-size:18px;border-radius:9px}.ib:hover{background:#ffffff14;filter:none}.ib.on{color:var(--ac)}
+.gt{margin-top:6px;font-weight:700;font-size:15px;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.gs{color:var(--mu);font-size:12px;margin-top:3px}
+button,input,select,textarea{font-family:inherit}
+h1,h2,h3,.name,.big,.st b,.hl,.sec{font-family:'Fredoka','Nunito',system-ui,sans-serif!important;font-weight:600;letter-spacing:0}.big{font-weight:700}
+h1{font-size:34px;line-height:1}.name{font-size:21px}.big{font-size:34px}
+.orb{opacity:.42}
+input[type=password]{flex:1;color:var(--tx);padding:12px 14px;border-radius:12px;font-size:15px;outline:none;width:100%}
+header{flex-wrap:nowrap!important;gap:12px!important}header>.sp{min-width:0}.st{padding:6px 11px}
+@media(max-width:1500px){header>#sw{display:none}}@media(max-width:1250px){header{flex-wrap:wrap!important}}
+:root{--gl:linear-gradient(135deg,#ffffff2b,#ffffff0a 42%,#ffffff17);--glb:#ffffff3d}
+.card,.st,.me,.toast,.an,.seg,.tab,.authc,button.g,input[type=text],input[type=number],input[type=password],select{
+background:var(--gl);-webkit-backdrop-filter:blur(26px) saturate(1.9) brightness(1.08);backdrop-filter:blur(26px) saturate(1.9) brightness(1.08);
+border:1px solid var(--glb);box-shadow:inset 0 1.5px 0 #ffffff70,inset 0 -1px 0 #ffffff14,inset 0 0 26px #ffffff0e,0 14px 44px #0000005c,0 1px 2px #0006}
+.card,.st,.me{position:relative;overflow:hidden}
+.card::before,.st::before,.me::before{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;background:radial-gradient(420px circle at var(--mx,18%) var(--my,0%),#ffffff30,transparent 58%);opacity:.75}
+.card::after,.st::after,.me::after{content:"";position:absolute;left:12%;right:12%;top:0;height:1px;background:linear-gradient(90deg,transparent,#fff9,transparent);pointer-events:none}
+.card:hover{transform:translateY(-2px)}
+button.g:hover,.tab:hover{background:linear-gradient(135deg,#ffffff3d,#ffffff12)}
+input::placeholder{color:#c9b8e6aa}
+.me{display:flex;align-items:center;gap:10px;padding:6px 14px 6px 8px;border-radius:99px;cursor:pointer;transition:.25s}.me:hover{transform:translateY(-2px)}
+.me i{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--ac),var(--ac2));display:grid;place-items:center;font-style:normal;font-weight:800}
+.me b{font-size:14px;line-height:1.1}.me small{color:var(--mu);font-size:11px}
+.st.low b{color:#ff6b8b}
+#auth,#acct{position:fixed;inset:0;z-index:100;display:none;place-items:center;background:#0b0614d9;-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px)}
+.authc{width:min(410px,92vw);padding:32px;border-radius:28px;text-align:center;position:relative;animation:in .5s both}
+.authc h1{font-size:46px;margin:4px 0 6px}
+.ifld{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--mu)}.ifld input{width:86px;padding:8px 10px}
+.urow{margin-bottom:14px}.urow .acts2{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center}
+.nv{position:fixed;z-index:5;width:54px;height:54px;border-radius:50%;padding:0;font-size:30px;line-height:1;display:grid;place-items:center;background:var(--gl);border:1px solid var(--glb);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px)}.nv:disabled{opacity:.25}
+.nv2{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);padding:5px 14px;border-radius:99px;background:#000a;font-size:13px;z-index:5}
+option{background:#1b1030;color:#fff}
+.dd{position:relative;flex:1;min-width:150px}
+.ddb{width:100%;display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 16px;border-radius:14px;font-size:15px;font-weight:600;background:var(--gl);border:1px solid var(--glb);color:var(--tx);-webkit-backdrop-filter:blur(26px) saturate(1.9);backdrop-filter:blur(26px) saturate(1.9);box-shadow:inset 0 1.5px 0 #ffffff70,0 10px 30px #0000004d}
+.ddb:hover{transform:none;filter:none;background:linear-gradient(135deg,#ffffff3d,#ffffff12)}.ddb i{font-style:normal;transition:transform .25s;opacity:.85}
+.dd.open .ddb{border-color:var(--ac);box-shadow:0 0 0 3px #ff3d8b33,inset 0 1.5px 0 #ffffff70}.dd.open .ddb i{transform:rotate(180deg)}
+.ddl{position:absolute;left:0;right:0;min-width:200px;top:calc(100% + 8px);z-index:70;display:none;padding:8px;border-radius:20px;max-height:300px;overflow:auto;background:linear-gradient(160deg,#2c1848f5,#130a22f7);border:1px solid #ffffff3d;-webkit-backdrop-filter:blur(30px) saturate(1.8);backdrop-filter:blur(30px) saturate(1.8);box-shadow:inset 0 1.5px 0 #ffffff55,0 26px 60px #000b}
+.dd.open .ddl{display:grid;gap:6px;animation:pop .22s}@keyframes pop{from{opacity:0;transform:translateY(-8px) scale(.96)}}
+.ddo{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 14px;border-radius:14px;font-weight:700;font-size:15px;color:#fff;background:#ffffff0f;border:1px solid #ffffff14;cursor:pointer;transition:.18s}
+.ddo i{font-style:normal;opacity:0;font-size:14px}
+.ddo:hover{background:linear-gradient(135deg,var(--ac),var(--ac2));transform:translateX(4px);box-shadow:0 6px 20px #ff3d8b40}
+.ddo.on{background:linear-gradient(135deg,var(--ac),var(--ac2));box-shadow:0 6px 22px #ff3d8b55}.ddo.on i{opacity:1}
+.card{border-radius:30px}.st{border-radius:24px}.toast,.an{border-radius:24px}.seg,.seg b,.tab,button,.chip,.ddb,.ddo,.dur,.badge,.me,.me i{border-radius:99px}
+input[type=text],input[type=number],input[type=password]{border-radius:99px;padding:13px 20px}
+.th,.gi{border-radius:28px}.ddl{border-radius:28px}.authc{border-radius:38px}svg.sp2{border-radius:22px}.viz,.pbar{border-radius:99px 99px 99px 99px}.viz{border-radius:18px}#modal video{border-radius:28px}.av{border-radius:50%}
+.brand{height:46px;border-radius:14px;display:block}.brand.big{height:70px;margin:0 auto}header .tag{color:var(--mu);font-size:12px;max-width:190px;line-height:1.25}
+html{scroll-behavior:smooth}
+#landing{display:none;padding:0 22px 60px;max-width:1180px;margin:0 auto}body.out #landing{display:block}
+body.out header,body.out .tabs,body.out .wrap,body.out #warn{display:none!important}
+.lnav{display:flex;align-items:center;gap:10px;position:sticky;top:14px;z-index:20;padding:9px 12px 9px 12px;border-radius:99px;margin-top:14px}.lnav a{color:var(--tx);text-decoration:none;font-weight:700;padding:8px 14px;border-radius:99px}.lnav a:hover{background:#ffffff1c}
+.hero{text-align:center;padding:60px 0 24px}.pill{display:inline-block;padding:7px 18px;border-radius:99px;font-weight:700;font-size:13px;background:#ffffff14;border:1px solid var(--glb);margin-bottom:18px}
+.hl{font-size:clamp(36px,6.4vw,72px);line-height:1.04;margin:0 auto 16px;max-width:920px;font-weight:700}.hl span{background:linear-gradient(90deg,var(--ac),var(--ac2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p{max-width:650px;margin:0 auto 26px;color:var(--mu);font-size:18px}.ctas{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}.big-btn{padding:15px 32px;font-size:17px}
+.mock{max-width:540px;margin:46px auto 0;padding:20px;text-align:left}.eq{display:flex;gap:4px;align-items:flex-end;height:74px;margin-top:16px}.eq i{flex:1;background:linear-gradient(var(--ac2),var(--ac));border-radius:99px;transform-origin:bottom;animation:eq 1.1s ease-in-out infinite alternate}@keyframes eq{to{transform:scaleY(.3)}}
+.feat,.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:18px}.feat .card,.steps .card{padding:24px}.feat b{font-family:'Fredoka',sans-serif;font-size:19px;display:block;margin:10px 0 4px}.feat .ic{font-size:32px}.feat p,.steps p{margin:0;color:var(--mu)}
+.sec{font-size:clamp(26px,4vw,40px);text-align:center;margin:76px 0 26px}.steps .card{text-align:center}.steps .n{width:48px;height:48px;border-radius:50%;display:grid;place-items:center;margin:0 auto 10px;font-family:'Fredoka',sans-serif;font-weight:700;font-size:21px;background:linear-gradient(135deg,var(--ac),var(--ac2))}.steps b{font-family:'Fredoka',sans-serif;font-size:19px}
+.cta2{margin-top:64px;padding:44px 20px;text-align:center}.cta2 h3{font-size:32px;margin:0 0 18px}footer{text-align:center;color:var(--mu);margin-top:40px;font-size:13px}
+.authc .x{position:absolute;right:16px;top:14px;width:38px;height:38px;padding:0}.sub{color:var(--mu);margin:12px 0 14px}
+.gh{width:100%;display:flex;align-items:center;justify-content:center;gap:10px;background:#24292f;border:1px solid #ffffff30;padding:13px}.gh:disabled{opacity:.45}
+.or{display:flex;align-items:center;gap:10px;color:var(--mu);font-size:12px;margin:14px 0}.or:before,.or:after{content:"";flex:1;height:1px;background:#ffffff26}
+@keyframes grow{from{transform:scaleY(0)}}
+body:not(.out){padding-left:100px}body.out #side{display:none!important}
+.wrap{grid-template-columns:1fr!important;max-width:1500px;margin:0 auto;padding:22px 32px 56px!important}.warn{margin:14px 32px 0!important}
+#cfgp{display:none;max-width:700px;margin:0 auto;width:100%}
+#side{position:fixed;left:14px;top:14px;bottom:14px;width:68px;z-index:40;display:flex;flex-direction:column;gap:6px;padding:12px 10px;border-radius:34px;overflow:hidden;transition:width .3s cubic-bezier(.2,.9,.3,1);background:var(--gl);-webkit-backdrop-filter:blur(26px) saturate(1.9);backdrop-filter:blur(26px) saturate(1.9);border:1px solid var(--glb);box-shadow:inset 0 1.5px 0 #ffffff70,0 14px 44px #0000005c}
+#side:hover{width:214px}#side .mk{width:44px;height:44px;border-radius:14px;margin:0 2px 12px;display:block;cursor:pointer}.sg{flex:1}
+.si{display:flex;align-items:center;gap:14px;height:48px;padding:0 13px;border-radius:99px;color:var(--mu);cursor:pointer;white-space:nowrap;transition:.2s;font-weight:700;flex:none}
+.si svg{width:22px;height:22px;flex:none;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.si span{opacity:0;transition:opacity .2s;line-height:1.1}#side:hover .si span{opacity:1}.si .ei{font-size:20px;width:22px;text-align:center;flex:none;font-style:normal}
+.si:hover{background:#ffffff18;color:#fff}.si.on{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#fff;box-shadow:0 8px 24px #ff3d8b44}
+.si #mav,#mav{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,var(--ac),var(--ac2));display:grid;place-items:center;font-style:normal;font-weight:800;color:#fff;flex:none;margin-left:-3px}
+#me span b{display:block;font-size:14px;color:var(--tx);max-width:120px;overflow:hidden;text-overflow:ellipsis}#me small{font-size:11px;color:var(--mu)}
+.hi{font-size:36px;margin:6px 0 2px}.sub2{color:var(--mu);margin:0 0 6px}.sec2{font-size:24px;margin:30px 0 14px}
+.hgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:16px;margin:20px 0}.hgrid .st{padding:18px 22px;text-align:left;border-radius:28px}.hgrid .st b{font-size:40px;display:block;line-height:1.1}.hgrid .st span{font-size:14px;text-transform:none;letter-spacing:0}
+.hrow{display:grid;grid-template-columns:1fr 1.3fr;gap:16px}@media(max-width:900px){.hrow{grid-template-columns:1fr}}
+.wk{display:flex;gap:14px;align-items:flex-end;height:150px;margin-top:14px}.wc{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:4px;height:100%}.wc i{width:100%;border-radius:99px;background:linear-gradient(var(--ac2),var(--ac));transform-origin:bottom;animation:grow .7s both}.wc b{font-size:13px}.wc span{font-size:11px;color:var(--mu);text-transform:uppercase}
+.rec{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:18px}.rc{cursor:pointer;transition:.2s}.rc:hover{transform:translateY(-3px)}.rt{position:relative;aspect-ratio:16/10;border-radius:24px;overflow:hidden;background:#150c24;border:1px solid var(--line)}.rt img{width:100%;height:100%;object-fit:cover;display:block}.rt .sc{position:absolute;left:10px;top:10px}
+.ptag{position:absolute;right:10px;top:10px;background:linear-gradient(135deg,#19e68c,#00b4d8);color:#04151a;font-weight:800;font-size:12px;padding:4px 11px;border-radius:99px;z-index:3}
+.gc.done .th,.rc.done .rt{filter:saturate(.55) brightness(.8)}.ib.pst.on{color:#19e68c}.ov button.on+button.on{background:linear-gradient(135deg,#19e68c,#00b4d8)}
+@media(max-width:700px){body:not(.out){padding-left:0;padding-bottom:88px}#side{left:10px;right:10px;top:auto;bottom:10px;width:auto;height:64px;flex-direction:row;padding:8px}#side:hover{width:auto}.si span,#side .mk{display:none}.si{padding:0 12px}}
+#side{background:linear-gradient(160deg,#ffffff22,#ffffff08),#160c26d9}.si{color:#d3c7e8}.wc i{max-width:46px}
+</style></head><body>
+<div class="orb o1"></div><div class="orb o2"></div><div class="orb o3"></div>
+<div id="landing">
+<nav class="lnav card"><img class="brand" src="/logo.png" alt="Clipfy"><span class="sp"></span><a href="#recursos">Recursos</a><a href="#como">Como funciona</a><button class="g" onclick="openAuth('login')">Entrar</button><button onclick="openAuth('signup')">Criar conta</button></nav>
+<section class="hero"><div class="pill">✨ Clipes de live no automático</div>
+<h2 class="hl">Suas lives viram <span>clipes virais</span> sozinhas</h2>
+<p>O Clipfy assiste às lives por você, descobre os melhores momentos pelo volume e pelo chat, corta, dá uma nota de 0 a 100 e guarda tudo numa biblioteca para você escolher o que baixar.</p>
+<div class="ctas"><button class="big-btn" onclick="openAuth('signup')">Começar agora</button><button class="g big-btn" onclick="openAuth('login')">Já tenho conta</button></div>
+<div class="mock card"><div class="top"><span class="big">98</span><div><div class="name" style="font-size:18px">Valorant · Clutch no último round</div><div class="lab"><span>🔊 pico de volume em 0:19</span><span>💬 chat disparou em 0:22</span></div></div></div><div class="eq" id="eq"></div></div></section>
+<section id="recursos"><h3 class="sec">Tudo que você precisa para clipar</h3><div class="feat">
+<div class="card"><div class="ic">🔴</div><b>Grava as lives sozinho</b><p>Twitch, YouTube e Kick. Quando a live abre, ele começa a gravar e guarda o arquivo completo.</p></div>
+<div class="card"><div class="ic">📈</div><b>Acha os melhores momentos</b><p>Detecta gritos, risadas e hype pelo volume do áudio e pelas explosões do chat.</p></div>
+<div class="card"><div class="ic">🔥</div><b>Nota de 0 a 100</b><p>Cada clipe ganha uma nota, com gráfico mostrando onde o volume subiu e onde o chat disparou.</p></div>
+<div class="card"><div class="ic">🏷️</div><b>Nomes automáticos</b><p>Usa o nome do jogo e do momento, ou uma IA que olha a tela e escreve o título.</p></div>
+<div class="card"><div class="ic">📚</div><b>Biblioteca com favoritos</b><p>Você escolhe quais clipes baixar. Filtre por nota, canal e favoritos, e baixe em formato vertical 9:16.</p></div>
+<div class="card"><div class="ic">✅</div><b>Controle o que já postou</b><p>Marque os clipes que você já publicou e veja no início quantos faltam postar.</p></div></div></section>
+<section id="como"><h3 class="sec">Como funciona</h3><div class="steps">
+<div class="card"><div class="n">1</div><b>Adicione os canais</b><p>Digite o nome do canal da Twitch ou cole o link da live.</p></div>
+<div class="card"><div class="n">2</div><b>Deixe rodando</b><p>O Clipfy vigia, grava e corta os momentos fortes enquanto você faz outras coisas.</p></div>
+<div class="card"><div class="n">3</div><b>Escolha e baixe</b><p>Abra a biblioteca, favorite os melhores e baixe só o que você quiser.</p></div></div></section>
+<section class="cta2 card"><h3>Pronto para parar de perder momentos?</h3><button class="big-btn" onclick="openAuth('signup')">Criar minha conta</button></section>
+<footer>Clipfy · feito para streamers e criadores de clipes</footer></div>
+<div id="auth"></div><div id="acct" onclick="if(event.target==this)this.style.display='none'"></div>
+
+<nav id="side"><img class="mk" src="/favicon.png" alt="Clipfy" onclick="go('home')">
+<div class="si on" data-t="home" onclick="go('home')"><svg viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg><span>Início</span></div>
+<div class="si" data-t="ch" onclick="go('ch')"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></svg><span>Canais</span></div>
+<div class="si" data-t="gal" onclick="go('gal')"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg><span>Biblioteca</span></div>
+<div class="si" data-t="cfg" onclick="go('cfg')"><svg viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg><span>Ajustes</span></div>
+<div class="si" data-t="adm" id="tadm" onclick="go('adm')" style="display:none"><svg viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg><span>Admin</span></div>
+<div class="sg"></div>
+<div class="si" title="Tokens de hoje" onclick="acct()"><i class="ei">🎟️</i><span id="sidetxt">—</span></div>
+<div class="si" id="me" onclick="acct()"><i id="mav">?</i><span><b id="mname"></b><small id="mrole"></small></span></div>
+<div class="sw" id="sw" style="display:none"></div></nav>
+<div id="warn"></div>
+<div class="wrap"><main style="min-width:0">
+<div id="home"><h2 class="hi">Olá, <span id="hname"></span> 👋</h2><p class="sub2">Veja como estão os seus clipes.</p>
+<div class="hgrid"><div class="st"><b id="s1">0</b><span>🔴 Ao vivo agora</span></div><div class="st"><b id="s2">0</b><span>✂️ Clipes hoje</span></div><div class="st"><b id="s3">0</b><span>📚 Na biblioteca</span></div><div class="st"><b id="s4">0</b><span>⭐ Favoritos</span></div>
+<div class="st"><b id="s6">0</b><span>✅ Já postados</span></div><div class="st"><b id="s7">0</b><span>🕓 Faltam postar</span></div><div class="st"><b id="s8">—</b><span>🔥 Melhor nota</span></div><div class="st" id="tk"><b id="s5">—</b><span>🎟️ Tokens hoje</span></div></div>
+<div class="hrow"><div class="card"><div class="name">Progresso de postagem</div><div class="pbar" style="margin:18px 0 10px;height:12px"><i id="pbp" style="width:0"></i></div><div class="log" id="pbt" style="margin:0"></div></div>
+<div class="card"><div class="name">Clipes nos últimos 7 dias</div><div class="wk" id="wk"></div></div></div>
+<h3 class="sec2">Últimos clipes</h3><div class="rec" id="rec"></div></div>
+<div id="canais"><div class="add"><input id="url" type="text" placeholder="Canal da Twitch (ex: gaules) ou link de live do YouTube / Kick"><button onclick="add()">+ Monitorar</button></div><div id="list"></div></div>
+<div id="gal"><div class="add"><select id="gf" onchange="gal()"><option value="">Todos os canais</option></select><select id="gs" onchange="gal()" style="max-width:170px"><option value="t">Mais recentes</option><option value="s">Melhor nota 🔥</option></select><select id="gm" onchange="gal()" style="max-width:160px"><option value="0">Todas as notas</option><option value="60">🔥 Nota 60+</option><option value="70">🔥 Nota 70+</option><option value="85">🔥 Nota 85+</option><option value="90">🔥 Nota 90+</option></select><select id="gp" onchange="gal()" style="max-width:190px"><option value="">Todos os clipes</option><option value="0">🕓 Não postados</option><option value="1">✅ Já postados</option></select><button class="g" id="gfav" onclick="favOnly=!favOnly;gal()">☆ Só favoritos</button><button class="g" onclick="dlFavs()">⬇ Baixar favoritos</button><button class="g" onclick="clean()">🧹 Limpar não favoritos</button></div><div style="display:flex;align-items:center;gap:12px"><h2 style="margin:4px 0 0;font-size:19px">Clipes na biblioteca <span id="gn" style="color:var(--mu);font-weight:500"></span></h2></div><div id="galg"></div></div>
+<div id="adm" style="display:none"></div>
+</main>
+<aside class="card" id="cfgp" style="align-self:start"><b>⚙️ Configurações</b>
+<label>Detectar por</label><div class="seg" id="mode"><b data-v="both">Áudio + chat</b><b data-v="audio">Áudio</b><b data-v="chat">Chat</b></div>
+<label>Sensibilidade: <span id="sv"></span> (maior = mais clipes)</label><input id="sens" type="range" min="1" max="10" oninput="sv.textContent=this.value" onchange="set()">
+<label>Volume mínimo para clipar: <span id="fv"></span></label><input id="floor" type="range" min="100" max="3000" step="100" oninput="fv.textContent=this.value" onchange="set()">
+<label>Renomear clipes automaticamente</label><div class="seg" id="rename"><b data-v="off">Não</b><b data-v="meta">Jogo + momento</b><b data-v="ai">IA vê a tela</b></div>
+<div id="aibox" style="display:none"><label>Chave da API Anthropic <small>(console.anthropic.com)</small></label><input id="apikey" type="password" placeholder="sk-ant-..." onchange="set()"><small id="aierr" style="color:#ff8a8a"></small></div>
+<label>Nota mínima do clipe: <span id="mv"></span> (clipes abaixo são descartados)</label><input id="minscore" type="range" min="0" max="90" step="5" oninput="mv.textContent=this.value" onchange="set()">
+<label>Duração mínima do estouro: <span id="uv"></span>s (ignora barulho curto)</label><input id="sustain" type="range" min="1" max="8" oninput="uv.textContent=this.value" onchange="set()">
+<label>Segundos ANTES do pico</label><input id="pre" type="number" min="5" max="120" onchange="set()">
+<label>Segundos DEPOIS do pico</label><input id="post" type="number" min="3" max="60" onchange="set()">
+<label>Intervalo mínimo entre clipes (s)</label><input id="cooldown" type="number" min="10" max="300" onchange="set()">
+<div class="row"><span>Vertical 9:16 (TikTok/Shorts)</span><div class="tg" id="vertical"></div></div>
+<div class="row"><span>Manter arquivo .ts da live</span><div class="tg" id="keep_ts"></div></div>
+<div class="row"><span>Som ao criar clipe</span><div class="tg" id="snd"></div></div>
+<div id="outbox"><label>Pasta de saída</label><input id="outdir" type="text" onchange="set()"></div>
+<div id="folders" style="margin-top:16px;display:flex;gap:8px"><button class="g" onclick="post('/api/open',{sub:'Biblioteca'})">📁 Biblioteca</button><button class="g" onclick="post('/api/open',{sub:'Lives'})">📁 Lives</button></div></aside></div>
+<div id="modal" onclick="if(event.target==this)closeM()"></div><div id="toasts"></div>
+<script>
+const $=s=>document.querySelector(s),esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const post=(p,b)=>fetch(p,{method:'POST',body:JSON.stringify(b||{})}).then(r=>{if(r.status==401)showAuth('login');return r.json()});
+let cfgInit=false,cards={},seen={},sound=localStorage.snd!=='0',tab='home',mode='both',rn='meta',ME={},authMode='',tickT=null;
+const TH={gta:['#ff3d8b','#ff9a3c'],roxo:['#9147ff','#ff4d8d'],verde:['#19e68c','#00b4d8'],azul:['#3b82f6','#22d3ee'],laranja:['#ff8a00','#ff3d71'],ouro:['#facc15','#fb7185']};
+function theme(n){const t=TH[n]||TH.roxo,r=document.documentElement.style;r.setProperty('--ac',t[0]);r.setProperty('--ac2',t[1]);localStorage.th=n}
+$('#sw').innerHTML=Object.keys(TH).map(k=>`<i title="${k}" style="background:linear-gradient(135deg,${TH[k][0]},${TH[k][1]})" onclick="theme('${k}')"></i>`).join('');theme(localStorage.th||'gta');
+function toast(m){const t=document.createElement('div');t.className='toast';t.innerHTML=m;$('#toasts').appendChild(t);setTimeout(()=>t.remove(),4600)}
+function beep(){if(!sound)return;try{const a=new(window.AudioContext||webkitAudioContext)(),o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.frequency.value=880;g.gain.setValueAtTime(.15,a.currentTime);g.gain.exponentialRampToValueAtTime(.001,a.currentTime+.4);o.start();o.stop(a.currentTime+.4)}catch(e){}}
+function count(el,v){const f=+el.textContent,s=performance.now();if(f===v)return;(function st(n){const p=Math.min((n-s)/600,1);el.textContent=Math.round(f+(v-f)*p);if(p<1)requestAnimationFrame(st)})(s)}
+function go(t){tab=t;document.querySelectorAll('.si[data-t]').forEach(x=>x.classList.toggle('on',x.dataset.t==t));
+const P={home:'#home',ch:'#canais',gal:'#gal',cfg:'#cfgp',adm:'#adm'};for(const k in P)$(P[k]).style.display=k==t?'block':'none';
+if(t=='gal')gal();if(t=='adm')admin();window.scrollTo(0,0)}
+document.querySelectorAll('.tg').forEach(t=>t.onclick=()=>{t.classList.toggle('on');if(t.id=='snd'){sound=t.classList.contains('on');localStorage.snd=sound?1:0}else set()});
+document.querySelectorAll('#mode b').forEach(b=>b.onclick=()=>{mode=b.dataset.v;showMode();set()});
+function showMode(){document.querySelectorAll('#mode b').forEach(b=>b.classList.toggle('on',b.dataset.v==mode))}
+function showRn(){document.querySelectorAll('#rename b').forEach(b=>b.classList.toggle('on',b.dataset.v==rn));$('#aibox').style.display=rn=='ai'?'block':'none'}
+document.querySelectorAll('#rename b').forEach(b=>b.onclick=()=>{rn=b.dataset.v;showRn();set()});
+async function add(){const v=$('#url').value.trim();if(v){const r=await post('/api/add',{url:v});$('#url').value='';toast(r.err?'⚠️ '+esc(r.err):'Canal adicionado ✅')}}
+$('#url').addEventListener('keydown',e=>{if(e.key==='Enter')add()});
+function set(){post('/api/settings',{mode,sens:+$('#sens').value,floor:+$('#floor').value,minscore:+$('#minscore').value,sustain:+$('#sustain').value,pre:+$('#pre').value,post:+$('#post').value,cooldown:+$('#cooldown').value,vertical:$('#vertical').classList.contains('on'),keep_ts:$('#keep_ts').classList.contains('on'),outdir:$('#outdir').value,rename:rn,apikey:$('#apikey').value});$('#apikey').value=''}
+const CL={};
+const mmss=t=>{t=Math.round(t);return (t/60|0)+':'+String(t%60).padStart(2,'0')};
+const info=st=>`🔊 Pico de volume em ${mmss(st.vt)} · ${st.cm?`💬 chat disparou em ${mmss(st.ctt)} (${st.cm} msgs/5s)`:'💬 sem dados de chat'}`;
+function viz(st,h=56){if(!st||!st.wave)return'';const w=st.wave,n=w.length,mx=Math.max(...w,1),cw=st.cw||[],cm=Math.max(...cw,1),bw=600/n;
+const bars=w.map((v,i)=>`<rect x="${(i*bw).toFixed(1)}" y="${(h-v/mx*(h-6)).toFixed(1)}" width="${(bw-1).toFixed(1)}" height="${(v/mx*(h-6)).toFixed(1)}" rx="1" fill="var(--ac)" opacity="${i==st.vi?1:.5}"/>`).join('');
+const cl=cw.length?`<polyline fill="none" stroke="var(--ac2)" stroke-width="2" points="${cw.map((v,i)=>`${(i*600/cw.length+bw/2).toFixed(1)},${(h-v/cm*(h-6)).toFixed(1)}`).join(' ')}"/>`:'';
+const mk=(i,c)=>`<line x1="${(i*bw+bw/2).toFixed(1)}" x2="${(i*bw+bw/2).toFixed(1)}" y1="0" y2="${h}" stroke="${c}" stroke-dasharray="3 3"/>`;
+return `<svg viewBox="0 0 600 ${h}" preserveAspectRatio="none" class="viz">${bars}${cl}${mk(st.vi,'#fff')}${st.cm>0?mk(st.ci,'var(--ac2)'):''}</svg>`}
+let PL=[],CUR='';const JP={};
+function play(rel){if(!PL.includes(rel))PL=[rel];showClip(rel)}
+function step(d){const i=PL.indexOf(CUR)+d;if(i>=0&&i<PL.length)showClip(PL[i])}
+const navHTML=rel=>{const i=PL.indexOf(rel),n=PL.length;return `<button class="nv" style="top:18px;right:22px" title="Fechar (Esc)" onclick="closeM()">✕</button>${n>1?`<button class="nv" style="left:22px;top:50%;margin-top:-27px" title="Clipe anterior (←)" onclick="step(-1)" ${i<=0?'disabled':''}>‹</button><button class="nv" style="right:22px;top:50%;margin-top:-27px" title="Próximo clipe (→)" onclick="step(1)" ${i>=n-1?'disabled':''}>›</button><div class="nv2">${i+1} / ${n}</div>`:''}`};
+addEventListener('keydown',e=>{if($('#modal').style.display=='grid'){if(e.key=='ArrowLeft')step(-1);if(e.key=='ArrowRight')step(1)}});
+function showClip(rel){CUR=rel;const k=CL[rel],st=k&&k.stats,m=$('#modal');
+m.innerHTML=`${navHTML(rel)}<div class="mb"><div class="top" style="margin-bottom:10px"><div class="name" style="color:#fff">${esc((k&&(k.title||k.name))||'')}</div><span class="sp"></span><button class="g" id="mfav" onclick="fav('${esc(rel).replace(/'/g,"\\'")}')">${k&&k.fav?'⭐ Favorito':'☆ Favoritar'}</button><button class="g" id="mpost" onclick="posted('${esc(rel).replace(/'/g,"\\'")}')">${k&&k.posted?'✔ Postado':'Marcar como postado'}</button><button onclick="dl('${esc(rel).replace(/'/g,"\\'")}')">⬇ Baixar</button></div><video src="/file?p=${encodeURIComponent(rel)}" controls autoplay></video>${st&&st.wave?`<div class="an">${viz(st,70)}<div class="lab"><span class="sc">🔥 Nota ${st.score}/100</span><span>${info(st)}</span><span>Média ${st.va} · Pico ${st.vp}</span><span style="color:#fff">┆ volume</span><span style="color:var(--ac2)">┆ chat</span></div></div>`:''}</div>`;m.style.display='grid'}
+function closeM(){$('#modal').style.display='none';$('#modal').innerHTML=''}addEventListener('keydown',e=>{if(e.key=='Escape')closeM()});
+const fmt=s=>[s/3600|0,(s/60|0)%60,s%60].map(x=>String(x).padStart(2,'0')).join(':');
+function line(a,max){const n=a.length;return a.map((v,i)=>`${((i+90-n)/89*600).toFixed(1)},${(74-Math.min(v/max,1)*66).toFixed(1)}`)}
+function mk(c){const el=document.createElement('div');el.className='card ch';
+el.innerHTML=`<div class="top"><div class="av"></div><div><div class="name"></div><div class="lab"><span class="el"></span></div></div><span class="badge"></span><span class="sp"></span><button class="g bp">⏸ Pausar</button><button class="g bc">✂️ Clipar agora</button><button class="g br">✕</button></div>
+<div class="log"></div><svg class="sp2" viewBox="0 0 600 80" preserveAspectRatio="none"><defs><linearGradient id="g${Object.keys(cards).length}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--ac)" stop-opacity=".5"/><stop offset="1" stop-color="var(--ac)" stop-opacity="0"/></linearGradient></defs><path class="pa" fill="url(#g${Object.keys(cards).length})"/><polyline class="pl" fill="none" stroke="var(--ac)" stroke-width="2"/><polyline class="pc" fill="none" stroke="var(--ac2)" stroke-width="2" stroke-dasharray="4 3"/></svg>
+<div class="meter"><i></i></div><div class="lab"><span style="color:var(--ac)">━ volume</span><span style="color:var(--ac2)">╍ chat</span><span class="nc"></span></div><div class="chips"></div>`;
+el.querySelector('.bp').onclick=()=>post('/api/pause',{url:c.key});el.querySelector('.bc').onclick=()=>post('/api/clip',{url:c.key});
+el.querySelector('.br').onclick=()=>{if(confirm('Remover este canal?'))post('/api/remove',{url:c.key})};
+$('#list').appendChild(el);cards[c.key]=el;seen[c.key]=c.clips.length;return el}
+function upd(c){const el=cards[c.key]||mk(c),q=s=>el.querySelector(s);
+q('.av').textContent=c.name[0];q('.name').textContent=c.name;const b=q('.badge');b.className='badge '+c.status;b.textContent=c.status.toUpperCase();
+q('.el').textContent=(c.elapsed?'⏱ '+fmt(c.elapsed):'')+(ME.role=='admin'&&c.owner!=ME.user?'  👤 '+c.owner:'');q('.log').textContent=c.log;el.classList.toggle('rec',c.status=='gravando');
+q('.bc').disabled=c.status!='gravando';q('.bp').textContent=c.paused?'▶ Retomar':'⏸ Pausar';
+const a=c.audio,mx=Math.max(...a,1200),pl=line(a,mx);q('.pl').setAttribute('points',pl.join(' '));
+q('.pa').setAttribute('d',pl.length?`M${pl[0]} L${pl.join(' L')} L600,80 L${pl[0].split(',')[0]},80Z`:'');
+const cm=Math.max(...c.chat,5);q('.pc').setAttribute('points',line(c.chat,cm).join(' '));
+q('.meter i').style.width=a.length?Math.min(a[a.length-1]/mx*100,100)+'%':'0';
+q('.nc').textContent=c.clips.length+' clipe(s)';c.clips.forEach(k=>CL[k.rel]=Object.assign(CL[k.rel]||{},k));
+q('.chips').innerHTML=c.clips.slice(-6).reverse().map(k=>`<div class="chip" data-r="${esc(k.rel)}">▶ ${esc(k.at)} · ${esc(k.reason)}${k.stats?' · 🔥'+k.stats.score:''}</div>`).join('');
+q('.chips').querySelectorAll('.chip').forEach(x=>x.onclick=()=>{PL=c.clips.slice(-6).reverse().map(k=>k.rel);play(x.dataset.r)});
+if(c.clips.length>(seen[c.key]||0)){const k=c.clips[c.clips.length-1];toast(`✂️ <b>Novo clipe</b> de ${esc(c.name)}<br><small>${esc(k.reason)}</small>`);beep();el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash');if(tab=='gal')gal()}
+seen[c.key]=c.clips.length}
+let favOnly=false;
+function dl(r){const a=document.createElement('a');a.href='/download?p='+encodeURIComponent(r);a.download='';document.body.appendChild(a);a.click();a.remove()}
+async function fav(r){const j=await post('/api/fav',{rel:r});if(CL[r])CL[r].fav=j.fav;const b=$('#mfav');if(b)b.textContent=j.fav?'⭐ Favorito':'☆ Favoritar';toast(j.fav?'⭐ Adicionado aos favoritos':'Removido dos favoritos');if(tab=='gal')gal()}
+async function posted(r){const j=await post('/api/posted',{rel:r});if(CL[r])CL[r].posted=j.posted;const b=$('#mpost');if(b)b.textContent=j.posted?'✔ Postado':'Marcar como postado';toast(j.posted?'✅ Marcado como postado':'Desmarcado');if(tab=='gal')gal()}
+let _hw='',_hr='';
+function home(d){const s=d.stats,t=s.total,pc=t?Math.round(s.posted/t*100):0;$('#pbp').style.width=pc+'%';$('#pbt').textContent=t?`${s.posted} de ${t} clipes já foram postados (${pc}%)`:'Quando os primeiros clipes chegarem, o progresso aparece aqui.';
+const w=JSON.stringify(s.week);if(w!==_hw){_hw=w;const mx=Math.max(...s.week.map(x=>x.n),1),dn=['dom','seg','ter','qua','qui','sex','sáb'];$('#wk').innerHTML=s.week.map((x,i)=>`<div class="wc"><b>${x.n}</b><i style="height:${Math.max(x.n/mx*92,5)}px;animation-delay:${i*.06}s"></i><span>${dn[new Date(x.d+'T12:00').getDay()]}</span></div>`).join('')}
+const r=JSON.stringify(d.recent.map(x=>[x.rel,x.posted,x.fav,x.title]));if(r!==_hr){_hr=r;d.recent.forEach(x=>CL[x.rel]=Object.assign(CL[x.rel]||{},x));
+$('#rec').innerHTML=d.recent.length?d.recent.map(x=>`<div class="rc ${x.posted?'done':''}"><div class="rt">${x.thumb?`<img src="/file?p=${encodeURIComponent(x.thumb)}" alt="">`:''}${x.stats&&x.stats.score!=null?`<span class="sc">🔥 ${x.stats.score}</span>`:''}${x.posted?'<span class="ptag">✔ POSTADO</span>':''}</div><div class="gt">${esc(x.title||(x.chan+' · '+(x.reason||'clipe')))}</div><div class="gs">${esc(x.chan)} · ${esc(x.when)}</div></div>`).join(''):'<div class="empty" style="grid-column:1/-1"><b>🎬</b>Nenhum clipe ainda. Adicione um canal e deixe o Clipfy trabalhar.</div>';
+$('#rec').querySelectorAll('.rc').forEach((el,i)=>el.onclick=()=>{PL=d.recent.map(y=>y.rel);play(d.recent[i].rel)})}}
+async function dlFavs(){const d=await (await fetch('/api/clips')).json(),L=d.clips.filter(x=>x.fav);if(!L.length)return toast('Nenhum favorito ainda ⭐');toast('Baixando '+L.length+' favorito(s)...');L.forEach((x,i)=>setTimeout(()=>dl(x.rel),i*800))}
+async function clean(){if(confirm('Apagar TODOS os clipes que não são favoritos? Isso não dá para desfazer.')){const j=await post('/api/clean');toast('🧹 '+j.n+' clipe(s) apagado(s)');gal()}}
+async function gal(){const d=await (await fetch('/api/clips')).json(),f=$('#gf'),cur=f.value;
+const chs=[...new Set(d.clips.map(x=>x.chan))];f.innerHTML='<option value="">Todos os canais</option>'+chs.map(x=>`<option ${x==cur?'selected':''}>${esc(x)}</option>`).join('');
+$('#gfav').textContent=(favOnly?'⭐':'☆')+' Só favoritos';
+d.clips.forEach(x=>CL[x.rel]=x);let L=d.clips.filter(x=>(!f.value||x.chan==f.value)&&(!favOnly||x.fav)&&((x.stats&&x.stats.score!=null?x.stats.score:0)>=+$('#gm').value)&&($('#gp').value===''||(x.posted?'1':'0')===$('#gp').value));$('#gn').textContent='('+L.length+')';
+if($('#gs').value=='s')L.sort((a,b)=>((b.stats||{}).score||0)-((a.stats||{}).score||0));
+const q=r=>esc(r).replace(/'/g,"\\'");
+PL=L.map(x=>x.rel);$('#galg').innerHTML=L.length?L.map(x=>{const r=q(x.rel),t=x.thumb?encodeURIComponent(x.thumb).replace(/'/g,'%27'):'';
+return `<div class="gc ${x.posted?'done':''}"><div class="th" onclick="play('${r}')">${x.thumb?`<div class="bg" style="background-image:url('/file?p=${t}')"></div><img class="fg" loading="lazy" src="/file?p=${t}">`:`<video class="fg" preload="metadata" muted src="/file?p=${encodeURIComponent(x.rel)}#t=1"></video>`}${x.posted?'<div class="ptag">✔ POSTADO</div>':''}<div class="ov" onclick="event.stopPropagation()"><button class="${x.fav?'on':''}" title="Favoritar" onclick="fav('${r}')">${x.fav?'♥':'♡'}</button><button class="${x.posted?'on':''}" title="Marcar como postado" onclick="posted('${r}')">✔</button><button title="Apagar" onclick="del('${r}')">🗑</button>${ME.owner?'<button title="Abrir pasta" onclick="post(\'/api/open\',{sub:\'Biblioteca\'})">📁</button>':''}</div><div class="pl">▶</div>${x.dur?`<div class="dur">00:00<span>${mmss(x.dur)}</span></div>`:''}</div>
+<div class="row2"><span class="big">${x.stats&&x.stats.score!=null?x.stats.score:'—'}</span><span class="sp"></span><button class="ib ${x.fav?'on':''}" title="Favoritar" onclick="fav('${r}')">${x.fav?'♥':'♡'}</button><button class="ib" title="Baixar" onclick="dl('${r}')">⤓</button><button class="ib" title="Ver análise" onclick="play('${r}')">📊</button><button class="ib pst ${x.posted?'on':''}" title="Marcar como postado" onclick="posted('${r}')">✔</button></div>
+<div class="gt">${esc(x.title||(x.chan+' · '+(x.reason||'clipe')))}</div><div class="gs">${esc(x.chan)} · ${esc(x.when)} · ${x.mb} MB${x.owner&&x.owner!=ME.user?' · 👤 '+esc(x.owner):''}</div></div>`}).join(''):`<div class="empty" style="grid-column:1/-1"><b>📚</b>${+$('#gm').value?'Nenhum clipe com nota '+$('#gm').value+' ou mais.':favOnly?'Nenhum favorito ainda.':'A biblioteca está vazia. Os clipes aparecem aqui e você escolhe quais baixar.'}</div>`}
+async function del(r){if(confirm('Apagar este clipe?')){await post('/api/delete',{rel:r});gal()}}
+async function tick(){let d;try{d=await (await fetch('/api/state')).json()}catch(e){return}
+if(d.err){showAuth('login');return}ME=d.me;meUI();
+if(!cfgInit){const c=d.cfg;for(const k of ['pre','post','cooldown','outdir','sens','floor','minscore','sustain'])$('#'+k).value=c[k];$('#sv').textContent=c.sens;$('#fv').textContent=c.floor;$('#mv').textContent=c.minscore;$('#uv').textContent=c.sustain;for(const k of ['vertical','keep_ts'])$('#'+k).classList.toggle('on',c[k]);$('#snd').classList.toggle('on',sound);mode=c.mode;showMode();rn=c.rename;showRn();cfgInit=true}
+$('#warn').innerHTML=d.missing.length?`<div class="warn">⚠️ Faltando instalar: <b>${d.missing.join(', ')}</b></div>`:'';
+$('#aierr').textContent=d.ai_err?'IA: '+d.ai_err:'';if(d.has_key)$('#apikey').placeholder='chave salva ✓ (cole outra para trocar)';count($('#s1'),d.channels.filter(c=>c.status=='gravando').length);count($('#s2'),d.stats.today);count($('#s3'),d.stats.total);count($('#s4'),d.stats.favs);count($('#s6'),d.stats.posted);count($('#s7'),d.stats.pending);$('#s8').textContent=d.stats.best==null?'—':d.stats.best;home(d);
+const urls=d.channels.map(c=>c.key);for(const u in cards)if(!urls.includes(u)){cards[u].remove();delete cards[u]}
+d.channels.forEach(upd);const em=$('#list .empty');if(!d.channels.length&&!em)$('#list').innerHTML='<div class="empty"><b>📡</b>Nenhum canal ainda.<br>Digite um canal acima e o Clipfy vigia, grava e clipa sozinho.</div>';else if(d.channels.length&&em)em.remove()}
+
+let ME0={},authTab='login';
+function showAuth(m){if(authMode==m)return;authMode=m;document.body.classList.add('out');closeAuth();if(m=='setup')openAuth('setup')}
+function closeAuth(){$('#auth').style.display='none'}
+function openAuth(t){authTab=t;const a=$('#auth'),su=t=='setup',lg=t=='login';a.style.display='grid';
+a.innerHTML=`<div class="authc"><button class="g x" onclick="closeAuth()" ${su?'style="display:none"':''}>✕</button><img class="brand big" src="/logo.png" alt="Clipfy">
+${su?'<p class="sub">Primeiro acesso: defina a senha do <b>administrador</b></p>':`<div class="seg" style="margin:16px 0"><b class="${lg?'on':''}" onclick="openAuth('login')">Entrar</b><b class="${lg?'':'on'}" onclick="openAuth('signup')">Criar conta</b></div>
+<button class="gh" onclick="location.href='/auth/github'" ${ME0.gh?'':'disabled title="O login com GitHub ainda não foi configurado pelo administrador"'}><svg width="20" height="20" viewBox="0 0 16 16" fill="#fff"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>Continuar com o GitHub</button><div class="or"><span>ou com e-mail</span></div>`}
+<input id="au" type="text" placeholder="${su?'Usuário':lg?'E-mail ou usuário':'Seu e-mail'}" ${su?'value="rafael_22" readonly':''} autocomplete="username"><input id="ap" type="password" placeholder="Senha (mínimo 6 caracteres)" style="margin-top:10px" autocomplete="current-password"><div id="ae" style="color:#ff8a8a;min-height:22px;font-size:13px;margin:8px 0 4px">${t=='signup'&&!ME0.signup?'Os cadastros estão fechados no momento.':''}</div><button style="width:100%" onclick="doAuth()">${su?'Criar administrador':lg?'Entrar':'Criar minha conta'}</button></div>`;
+$('#ap').addEventListener('keydown',e=>{if(e.key==='Enter')doAuth()});(su?$('#ap'):$('#au')).focus()}
+async function doAuth(){const t=authTab,url=t=='setup'?'/api/setup':t=='signup'?'/api/signup':'/api/login',body=t=='signup'?{email:$('#au').value,pass:$('#ap').value}:{user:$('#au').value,pass:$('#ap').value};
+const j=await fetch(url,{method:'POST',body:JSON.stringify(body)}).then(r=>r.json());if(j.err){$('#ae').textContent=j.err;return}startApp()}
+function startApp(){document.body.classList.remove('out');closeAuth();go('home');authMode='';cfgInit=false;cards={};seen={};$('#list').innerHTML='';tick();if(!tickT)tickT=setInterval(tick,2000)}
+async function boot(){$('#eq').innerHTML=Array.from({length:34},(_,i)=>`<i style="animation-delay:${(i*.07).toFixed(2)}s;height:${25+Math.abs(Math.sin(i*.75))*75}%"></i>`).join('');
+const q=new URLSearchParams(location.search),m=await (await fetch('/api/me')).json();ME0=m;
+if(q.get('err')){toast({github:'⚠️ Não foi possível entrar com o GitHub.',gh_off:'⚠️ O login com GitHub não está configurado.',fechado:'⚠️ Os cadastros estão fechados no momento.'}[q.get('err')]||'⚠️ Erro ao entrar.');history.replaceState({},'','/')}
+if(m.setup)return showAuth('setup');if(!m.user)return showAuth('login');startApp()}
+const cfgCard=c=>`<div class="card ch urow"><div class="name" style="margin-bottom:10px">Cadastro e login</div><div class="top"><span class="ifld">Novos cadastros abertos</span><div class="tg ${c.signup_open?'on':''}" id="so" onclick="this.classList.toggle('on')"></div><span class="ifld">🎟️ tokens/dia <input id="sl" type="number" min="0" value="${c.signup_limit}"></span><span class="ifld">canais <input id="sc" type="number" min="0" value="${c.signup_channels}"></span></div>
+<div class="log" style="margin:14px 0 8px">Login com GitHub: crie um <b>OAuth App</b> em github.com/settings/developers e use esta <b>Callback URL</b>: <code style="color:#fff">${esc(c.callback)}</code></div><div class="top"><input id="gi" type="text" placeholder="GitHub Client ID" value="${esc(c.gh_id)}" style="max-width:260px"><input id="gs2" type="password" placeholder="${c.gh_set?'Client Secret salvo ✓ (cole outro para trocar)':'GitHub Client Secret'}" style="max-width:320px"><button onclick="cfgSave()">Salvar</button></div></div>`;
+async function cfgSave(){const j=await post('/api/admin/config',{signup_open:$('#so').classList.contains('on'),signup_limit:+$('#sl').value,signup_channels:+$('#sc').value,gh_id:$('#gi').value,gh_secret:$('#gs2').value});toast(j.err?'⚠️ '+esc(j.err):'✅ Salvo');admin()}
+function meUI(){const m=ME,adm=m.role=='admin';$('#mav').textContent=(m.user||'?')[0].toUpperCase();$('#mname').textContent=m.display||m.user;$('#hname').textContent=m.display||m.user;$('#sidetxt').textContent=m.left==null?'∞':m.left+'/'+m.limit;$('#mrole').textContent=m.owner?'Dono':adm?'Administrador':'Usuário';
+$('#s5').textContent=m.left==null?'∞':m.left+'/'+m.limit;$('#tk').classList.toggle('low',m.left===0);$('#tadm').style.display=adm?'':'none';['outbox','folders'].forEach(i=>$('#'+i).style.display=m.owner?'':'none')}
+function acct(){const m=ME,a=$('#acct');a.style.display='grid';
+a.innerHTML=`<div class="authc" style="text-align:left"><h2 style="margin:0 0 6px;font-size:28px">👤 ${esc(m.display||m.user)}</h2><div class="lab" style="margin-bottom:12px"><span class="badge ${m.role=='admin'?'gravando':''}">${m.owner?'DONO':m.role=='admin'?'ADMINISTRADOR':'USUÁRIO'}</span></div><div class="log">🎟️ Tokens hoje: <b style="color:#fff">${m.left==null?'ilimitados':m.left+' de '+m.limit}</b> (renovam à meia-noite)<br>📡 Canais: <b style="color:#fff">${m.channels}${m.max_channels==null?'':' de '+m.max_channels}</b></div><label style="color:var(--mu);font-size:13px">Tema</label><div class="sw" style="margin:8px 0 14px">${$('#sw').innerHTML}</div><label style="color:var(--mu);font-size:13px">Trocar senha</label><input id="po" type="password" placeholder="Senha atual" style="margin:6px 0"><input id="pn" type="password" placeholder="Nova senha (mínimo 6)"><div style="display:flex;gap:8px;margin-top:14px"><button onclick="chpw()">Salvar senha</button><button class="g" onclick="logout()">Sair</button><span class="sp"></span><button class="g" onclick="$('#acct').style.display='none'">Fechar</button></div></div>`}
+async function chpw(){const j=await post('/api/passwd',{old:$('#po').value,new:$('#pn').value});toast(j.err?'⚠️ '+esc(j.err):'✅ Senha alterada');if(!j.err)$('#acct').style.display='none'}
+async function logout(){await post('/api/logout');$('#acct').style.display='none';showAuth('login')}
+async function adm(op,b){const j=await post('/api/admin/'+op,b);toast(j.err?'⚠️ '+esc(j.err):'✅ Feito');admin()}
+let ADM=null,admSub='users';
+const fdt=t=>t?new Date(t*1000).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+async function admin(){ADM=await (await fetch('/api/admin/users')).json();if(!ADM.users)return;renderAdm()}
+function renderAdm(){const own=ADM.own,keep=$('#uq')?$('#uq').value:'';
+$('#adm').innerHTML=`<div class="seg" style="max-width:460px;margin-bottom:18px"><b class="${admSub=='users'?'on':''}" onclick="admSub='users';renderAdm()">👥 Usuários cadastrados</b>${own?`<b class="${admSub=='cfg'?'on':''}" onclick="admSub='cfg';renderAdm()">⚙️ Cadastro e login</b>`:''}</div><div id="admb"></div>`;
+if(admSub=='cfg'&&own){$('#admb').innerHTML=cfgCard(ADM.config);return}
+const U=ADM.users,na=U.filter(u=>u.role=='admin').length;
+$('#admb').innerHTML=`<div class="hgrid" style="margin-top:0"><div class="st"><b>${U.length}</b><span>👥 Cadastrados</span></div><div class="st"><b>${na}</b><span>🛡️ Administradores</span></div><div class="st"><b>${U.length-na}</b><span>🙂 Usuários</span></div><div class="st"><b>${U.filter(u=>!u.active).length}</b><span>⛔ Desativados</span></div></div>
+<div class="card ch urow"><div class="name" style="margin-bottom:10px">Novo usuário</div><div class="top"><input id="nn" type="text" placeholder="usuário" style="max-width:170px"><input id="np" type="password" placeholder="senha (mín. 6)" style="max-width:170px"><span class="ifld">🎟️ tokens/dia <input id="nl" type="number" value="30" min="0"></span><span class="ifld">canais <input id="nm" type="number" value="3" min="0"></span><button onclick="adm('create',{name:$('#nn').value,pass:$('#np').value,limit:+$('#nl').value,max_channels:+$('#nm').value})">+ Criar</button></div></div>
+<input id="uq" type="text" placeholder="🔍 Buscar por nome, e-mail ou usuário..." oninput="renderUL()" style="margin:6px 0 16px"><div id="ul"></div>`;
+if(keep)$('#uq').value=keep;renderUL()}
+function renderUL(){const q=($('#uq')||{value:''}).value.trim().toLowerCase(),own=ADM.own;
+const L=ADM.users.filter(u=>!q||(u.name+' '+(u.display||'')+' '+(u.email||'')).toLowerCase().includes(q));
+$('#ul').innerHTML=L.length?L.map(u=>userRow(u,own)).join(''):'<div class="empty">Nenhum usuário encontrado.</div>'}
+function userRow(u,own){const a=u.role=='admin',pc=a?100:Math.min(u.used/Math.max(u.limit,1)*100,100),pv={email:'E-MAIL',gh:'GITHUB',manual:'CRIADO PELO ADMIN'}[u.provider]||'MANUAL',n=u.name;
+let ac;if(u.owner)ac='<div class="log" style="margin:12px 0 0">Conta do dono: não pode ser alterada.</div>';else if(a&&!own)ac='<div class="log" style="margin:12px 0 0">Só o dono pode alterar administradores.</div>';
+else ac=`<div class="acts2">${a?'':`<span class="ifld">tokens/dia <input id="l_${n}" type="number" min="0" value="${u.limit}"></span><span class="ifld">máx. canais <input id="m_${n}" type="number" min="0" value="${u.max_channels}"></span><button onclick="adm('update',{name:'${n}',limit:+$('#l_${n}').value,max_channels:+$('#m_${n}').value})">Salvar</button><button class="g" onclick="adm('update',{name:'${n}',reset:true})">Zerar uso de hoje</button>`}${own?`<button class="g" onclick="if(confirm('${a?'Remover o cargo de administrador de':'Dar o cargo de ADMINISTRADOR para'} ${n}?${a?'':' Ele poderá gerenciar usuários e terá tokens ilimitados.'}'))adm('update',{name:'${n}',role:'${a?'user':'admin'}'})">${a?'Remover administrador':'👑 Tornar administrador'}</button>`:''}<button class="g" onclick="var p=prompt('Nova senha para ${n} (mín. 6):');if(p)adm('update',{name:'${n}',pass:p})">🔑 Senha</button><button class="g" onclick="adm('update',{name:'${n}',active:${!u.active}})">${u.active?'Desativar':'Ativar'}</button><button class="g" onclick="if(confirm('Excluir ${n}? Os clipes dele continuam no disco.'))adm('delete',{name:'${n}'})">🗑</button></div>`;
+return `<div class="card ch urow"><div class="top"><div class="av">${esc(((u.display||n)[0]||'?').toUpperCase())}</div><div style="min-width:0"><div class="name">${esc(u.display||n)}</div><div class="lab"><span class="badge ${a?'gravando':''}">${u.owner?'DONO':a?'ADMIN':'USUÁRIO'}</span>${u.owner?'':`<span class="badge">${pv}</span>`}${u.active?'':'<span class="badge erro">DESATIVADO</span>'}</div></div><span class="sp"></span><b>🎟️ ${a?'∞':u.used+' / '+u.limit}</b></div>
+<div class="lab" style="margin-top:10px"><span>@${esc(n)}${u.email?' · '+esc(u.email):''}</span></div><div class="lab" style="margin-top:2px"><span>📡 ${u.channels} canal(is)</span><span>🗓️ cadastro ${fdt(u.created)}</span><span>🕓 último acesso ${fdt(u.last)}</span></div><div class="pbar"><i style="width:${pc}%"></i></div>${ac}</div>`}
+document.addEventListener('pointermove',e=>{const c=e.target.closest&&e.target.closest('.card,.st,.me');if(c){const r=c.getBoundingClientRect();c.style.setProperty('--mx',(e.clientX-r.left)+'px');c.style.setProperty('--my',(e.clientY-r.top)+'px')}});
+function closeDD(){document.querySelectorAll('.dd.open').forEach(d=>d.classList.remove('open'))}
+function enhance(sel){if(sel._dd)return;const dd=document.createElement('div');dd.className='dd';dd.style.maxWidth=sel.style.maxWidth;
+dd.innerHTML='<button type="button" class="ddb"><span></span><i>▾</i></button><div class="ddl"></div>';sel.parentNode.insertBefore(dd,sel);sel.style.display='none';sel._dd=dd;
+const b=dd.querySelector('.ddb'),l=dd.querySelector('.ddl'),sync=()=>{const o=sel.options[sel.selectedIndex];b.firstChild.textContent=o?o.text:''};
+sync();new MutationObserver(sync).observe(sel,{childList:true,subtree:true,attributes:true});sel.addEventListener('change',sync);
+b.onclick=e=>{e.stopPropagation();const was=dd.classList.contains('open');closeDD();if(was)return;
+l.innerHTML=[...sel.options].map((o,i)=>`<div class="ddo${i==sel.selectedIndex?' on':''}" data-i="${i}"><span>${esc(o.text)}</span><i>✓</i></div>`).join('');
+l.querySelectorAll('.ddo').forEach(x=>x.onclick=ev=>{ev.stopPropagation();sel.selectedIndex=+x.dataset.i;sel.dispatchEvent(new Event('change'));closeDD()});dd.classList.add('open')}}
+document.addEventListener('click',closeDD);addEventListener('keydown',e=>{if(e.key=='Escape')closeDD()});
+document.querySelectorAll('select').forEach(enhance);
+boot();
+</script></body></html>"""
+
+
+def list_clips():
+    base, out = CFG["outdir"], []
+    u = getattr(CTX, "user", None)
+    roots = [os.path.join(base, "Biblioteca"), os.path.join(base, "Clipes")] if is_owner(u) else [os.path.join(base, "Biblioteca", u or "_")]
+    for dp, _, fs in [t for r in roots for t in os.walk(r)]:
+        for f in fs:
+            if f.lower().endswith(".mp4"):
+                p = os.path.join(dp, f)
+                st = os.stat(p)
+                info = {}
+                try:
+                    info = json.load(open(p[:-4] + ".json", encoding="utf-8"))
+                except Exception:
+                    pass
+                out.append({"owner": owner_of(p, base), "thumb": (os.path.relpath(p[:-4] + ".jpg", base).replace("\\", "/") if os.path.exists(p[:-4] + ".jpg") else None),
+                            "dur": info.get("dur"), "fav": bool(info.get("fav")), "posted": bool(info.get("posted")), "stats": info.get("stats"), "reason": info.get("reason"), "title": info.get("title"), "rel": os.path.relpath(p, base).replace("\\", "/"), "chan": os.path.basename(dp),
+                            "mt": st.st_mtime, "mb": round(st.st_size / 1048576, 1),
+                            "when": datetime.fromtimestamp(st.st_mtime).strftime("%d/%m %H:%M")})
+    out.sort(key=lambda x: -x["mt"])
+    return out
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def send(self, obj, code=200, ctype="application/json"):
+        body = obj if isinstance(obj, bytes) else json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        if getattr(self, "_ck", None) is not None:
+            self.send_header("Set-Cookie", f"csid={self._ck}; Path=/; HttpOnly; SameSite=Lax; Max-Age={2592000 if self._ck else 0}")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def me(self):
+        m = re.search(r"csid=([\w\-]+)", self.headers.get("Cookie", ""))
+        u = SESS.get(m.group(1)) if m else None
+        return u if u in USERS and USERS[u].get("active", True) else None
+
+    def go(self, url, ck=None):
+        self.send_response(302)
+        self.send_header("Location", url)
+        if ck:
+            self.send_header("Set-Cookie", f"csid={ck}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def gh_start(self):
+        from urllib.parse import urlencode
+        if not (CFG["gh_id"] and CFG["gh_secret"]):
+            return self.go("/?err=gh_off")
+        st = secrets.token_urlsafe(16)
+        OAUTH[st] = time.time() + 600
+        host = self.headers.get("Host", f"localhost:{PORT}")
+        self.go("https://github.com/login/oauth/authorize?" + urlencode(
+            {"client_id": CFG["gh_id"], "redirect_uri": f"http://{host}/auth/github/callback",
+             "scope": "read:user user:email", "state": st}))
+
+    def gh_callback(self):
+        from urllib.parse import urlparse, parse_qs, urlencode
+        q = parse_qs(urlparse(self.path).query)
+        st, code = q.get("state", [""])[0], q.get("code", [""])[0]
+        if OAUTH.pop(st, 0) < time.time() or not code:
+            return self.go("/?err=github")
+        try:
+            req = urllib.request.Request("https://github.com/login/oauth/access_token", urlencode(
+                {"client_id": CFG["gh_id"], "client_secret": CFG["gh_secret"], "code": code}).encode(),
+                {"Accept": "application/json"})
+            tok = json.load(urllib.request.urlopen(req, timeout=20)).get("access_token")
+            hdr = {"Authorization": f"Bearer {tok}", "User-Agent": "Clipfy", "Accept": "application/vnd.github+json"}
+            gu = json.load(urllib.request.urlopen(urllib.request.Request("https://api.github.com/user", headers=hdr), timeout=20))
+            email = gu.get("email") or ""
+            if not email:
+                try:
+                    em = json.load(urllib.request.urlopen(urllib.request.Request("https://api.github.com/user/emails", headers=hdr), timeout=20))
+                    email = next((e["email"] for e in em if e.get("primary") and e.get("verified")), "")
+                except Exception:
+                    pass
+        except Exception:
+            return self.go("/?err=github")
+        if not tok or not gu.get("login"):
+            return self.go("/?err=github")
+        key = oauth_user("gh", gu["login"], email)
+        if not key:
+            return self.go("/?err=fechado")
+        USERS[key]["last"] = time.time()
+        sid = secrets.token_urlsafe(24)
+        SESS[sid] = key
+        self.go("/", sid)
+
+    def serve_file(self, dl=False):
+        from urllib.parse import urlparse, parse_qs, quote
+        rel = parse_qs(urlparse(self.path).query).get("p", [""])[0]
+        base = os.path.realpath(CFG["outdir"])
+        p = os.path.realpath(os.path.join(base, rel))
+        rp = os.path.relpath(p, base).replace("\\", "/")
+        if not p.startswith(base + os.sep) or not os.path.isfile(p) or not can_access(rp, CTX.user):
+            return self.send({"err": 1}, 404)
+        size = os.path.getsize(p)
+        a, b, code = 0, size - 1, 200
+        rng = self.headers.get("Range")
+        if rng and rng.startswith("bytes="):
+            s0, _, e0 = rng[6:].partition("-")
+            a = int(s0 or 0)
+            b = min(int(e0), size - 1) if e0 else size - 1
+            code = 206
+        self.send_response(code)
+        self.send_header("Content-Type", "image/jpeg" if p.endswith(".jpg") else "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        if dl:
+            self.send_header("Content-Disposition", "attachment; filename*=UTF-8\'\'" + quote(os.path.basename(p)))
+        self.send_header("Content-Length", str(b - a + 1))
+        if code == 206:
+            self.send_header("Content-Range", f"bytes {a}-{b}/{size}")
+        self.end_headers()
+        try:
+            with open(p, "rb") as f:
+                f.seek(a)
+                left = b - a + 1
+                while left > 0:
+                    d = f.read(min(65536, left))
+                    if not d:
+                        break
+                    self.wfile.write(d)
+                    left -= len(d)
+        except (BrokenPipeError, ConnectionError):
+            pass
+
+    def do_GET(self):
+        CTX.user = u = self.me()
+        path = self.path.split("?")[0]
+        if path == "/api/me":
+            return self.send(me_info(u))
+        if path == "/logo.png":
+            return self.send(base64.b64decode(LOGO_B64), ctype="image/png")
+        if path == "/favicon.png":
+            return self.send(base64.b64decode(FAV_B64), ctype="image/png")
+        if path == "/auth/github":
+            return self.gh_start()
+        if path == "/auth/github/callback":
+            return self.gh_callback()
+        if not path.startswith(("/api", "/file", "/download")):
+            return self.send(PAGE.encode(), ctype="text/html")
+        if not u:
+            return self.send({"err": "login"}, 401)
+        adm, own = is_admin(u), is_owner(u)
+        if path == "/download":
+            return self.serve_file(True)
+        if path == "/file":
+            return self.serve_file()
+        if path == "/api/clips":
+            return self.send({"clips": list_clips()})
+        if path == "/api/admin/users":
+            if not adm:
+                return self.send({"err": "Apenas administradores"}, 403)
+            out = []
+            for k, r in USERS.items():
+                tokens_left(k)
+                out.append({"name": k, "display": r.get("display") or r.get("email") or k, "role": r["role"], "limit": r["limit"], "used": r["used"]["n"],
+                            "max_channels": r["max_channels"], "active": r.get("active", True), "channels": len(r["channels"]),
+                            "email": r.get("email", ""), "provider": r.get("provider", "manual"), "created": r.get("created"),
+                            "last": r.get("last"), "owner": k == ADMIN_NAME})
+            host = self.headers.get("Host", f"localhost:{PORT}")
+            return self.send({"users": out, "own": own, "config": None if not own else {
+                "signup_open": bool(CFG["signup_open"]), "signup_limit": CFG["signup_limit"], "signup_channels": CFG["signup_channels"],
+                "gh_id": CFG["gh_id"], "gh_set": bool(CFG["gh_secret"]), "callback": f"http://{host}/auth/github/callback"}})
+        if path == "/api/state":
+            cl = list_clips()
+            t0 = time.mktime(datetime.now().replace(hour=0, minute=0, second=0).timetuple())
+            miss = (["streamlink"] if not SL else []) + ([] if shutil.which("ffmpeg") else ["ffmpeg"])
+            return self.send({"cfg": {k: CFG[k] for k in DEFAULT if k not in ("channels", "apikey", "gh_secret", "gh_id", "signup_open", "signup_limit", "signup_channels")}, "missing": miss,
+                              "me": me_info(u), "recent": [{k: x[k] for k in ("rel", "title", "chan", "thumb", "stats", "posted", "fav", "when", "dur", "reason")} for x in cl[:6]],
+                              "ai_err": AI_ERR[0], "has_key": bool(CFG.get("apikey")),
+                              "stats": {"favs": sum(1 for x in cl if x["fav"]), "total": len(cl),
+                                        "posted": sum(1 for x in cl if x["posted"]), "pending": sum(1 for x in cl if not x["posted"]),
+                                        "best": max([x["stats"]["score"] for x in cl if x.get("stats") and x["stats"].get("score") is not None], default=None),
+                                        "week": [{"d": str(date.today() - timedelta(days=i)), "n": sum(1 for x in cl if date.fromtimestamp(x["mt"]) == date.today() - timedelta(days=i))} for i in range(6, -1, -1)],
+                                        "today": sum(1 for x in cl if x["mt"] >= t0)},
+                              "channels": [m.snapshot() for m in MON.values() if own or m.owner == u]})
+        self.send({"err": "?"}, 404)
+
+    def do_POST(self):
+        CTX.user = u = self.me()
+        self._ck = None
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            b = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            b = {}
+        P, res = self.path, {"ok": True}
+        # ---- rotas públicas ----
+        if P == "/api/setup" and ADMIN_NAME not in USERS:
+            name, pw = str(b.get("user", "")).strip().lower(), str(b.get("pass", ""))
+            if name != ADMIN_NAME:
+                return self.send({"err": f"O primeiro acesso é exclusivo do administrador ({ADMIN_NAME})."})
+            if len(pw) < 6:
+                return self.send({"err": "A senha precisa ter no mínimo 6 caracteres."})
+            new_user(name, pw, "admin", 0, 0)
+            USERS[name].update(email=ADMIN_EMAIL, display=ADMIN_NAME)
+            USERS[name]["channels"] = list(dict.get(CFG, "channels", []))
+            save_users(); start_user(name)
+            sid = secrets.token_urlsafe(24); SESS[sid] = name; self._ck = sid
+            return self.send(res)
+        if P == "/api/login":
+            name = find_user(b.get("user", ""))
+            r = USERS.get(name)
+            if not (r and r.get("active", True) and hmac.compare_digest(hpw(str(b.get("pass", "")), r["salt"]), r["hash"])):
+                time.sleep(0.6)
+                return self.send({"err": "Usuário ou senha incorretos"}, 401)
+            USERS[name]["last"] = time.time(); save_users()
+            sid = secrets.token_urlsafe(24); SESS[sid] = name; self._ck = sid
+            return self.send(res)
+        if P == "/api/signup":
+            email, pw = str(b.get("email", "")).strip().lower(), str(b.get("pass", ""))
+            if ADMIN_NAME not in USERS or not CFG["signup_open"]:
+                return self.send({"err": "Os cadastros estão fechados no momento."})
+            if not re.fullmatch(r"[^@\s]{1,64}@[^@\s]+\.[^@\s]{2,}", email):
+                return self.send({"err": "Digite um e-mail válido."})
+            if len(pw) < 6:
+                return self.send({"err": "A senha precisa ter no mínimo 6 caracteres."})
+            if find_user(email):
+                return self.send({"err": "Esse e-mail já tem uma conta. Use a aba Entrar."})
+            key = make_key(email)
+            new_user(key, pw, "user", int(CFG["signup_limit"]), int(CFG["signup_channels"]))
+            USERS[key].update(email=email, display=email, provider="email")
+            save_users()
+            sid = secrets.token_urlsafe(24); SESS[sid] = key; self._ck = sid
+            return self.send(res)
+        if P == "/api/logout":
+            m = re.search(r"csid=([\w\-]+)", self.headers.get("Cookie", ""))
+            SESS.pop(m.group(1) if m else "", None); self._ck = ""
+            return self.send(res)
+        if not u:
+            return self.send({"err": "login"}, 401)
+        adm, own = is_admin(u), is_owner(u)
+        # ---- administração ----
+        if P.startswith("/api/admin/"):
+            if not adm:
+                return self.send({"err": "Apenas administradores"}, 403)
+            op, name = P.rsplit("/", 1)[1], str(b.get("name", "")).strip().lower()
+            if op == "config":
+                if not own:
+                    return self.send({"err": "Só o dono pode mudar essas configurações"})
+                if "signup_open" in b: CFG["signup_open"] = bool(b["signup_open"])
+                for k in ("signup_limit", "signup_channels"):
+                    if k in b: CFG[k] = max(0, int(b[k]))
+                if "gh_id" in b: CFG["gh_id"] = str(b["gh_id"]).strip()
+                if b.get("gh_secret"): CFG["gh_secret"] = str(b["gh_secret"]).strip()
+                save_cfg()
+                return self.send(res)
+            if op == "create":
+                if not re.fullmatch(r"[a-z0-9_.-]{3,20}", name):
+                    res = {"err": "Nome: 3 a 20 letras minúsculas/números"}
+                elif name in USERS:
+                    res = {"err": "Esse usuário já existe"}
+                elif reserved(name):
+                    res = {"err": "Esse nome é reservado ao administrador"}
+                elif len(str(b.get("pass", ""))) < 6:
+                    res = {"err": "Senha com no mínimo 6 caracteres"}
+                else:
+                    new_user(name, str(b["pass"]), "user",
+                             max(0, int(b.get("limit", 30))), max(0, int(b.get("max_channels", 3))))
+                    save_users()
+            elif name not in USERS:
+                res = {"err": "Usuário não existe"}
+            elif USERS[name]["role"] == "admin" and not own:
+                res = {"err": "Só o dono pode alterar administradores"}
+            elif op == "update":
+                r = USERS[name]
+                if "limit" in b: r["limit"] = max(0, int(b["limit"]))
+                if "max_channels" in b: r["max_channels"] = max(0, int(b["max_channels"]))
+                if "role" in b:
+                    if name == ADMIN_NAME:
+                        res = {"err": "O dono não pode perder o cargo"}
+                    elif not own:
+                        res = {"err": "Só o dono pode dar ou tirar o cargo de administrador"}
+                    else:
+                        r["role"] = "admin" if b["role"] == "admin" else "user"
+                if b.get("reset"): r["used"] = {"d": str(date.today()), "n": 0}
+                if len(str(b.get("pass", ""))) >= 6:
+                    r["salt"] = secrets.token_hex(16); r["hash"] = hpw(str(b["pass"]), r["salt"])
+                if "active" in b:
+                    if name == u and not b["active"]:
+                        res = {"err": "Você não pode desativar a si mesmo"}
+                    else:
+                        r["active"] = bool(b["active"])
+                        stop_user(name) if not r["active"] else start_user(name)
+                save_users()
+            elif op == "delete":
+                if name == u or name == ADMIN_NAME:
+                    res = {"err": "Essa conta não pode ser excluída"}
+                else:
+                    stop_user(name); USERS.pop(name); save_users()
+                    for k in [k for k, v in SESS.items() if v == name]: SESS.pop(k)
+            return self.send(res)
+        # ---- usuário comum ----
+        if P == "/api/passwd":
+            r = USERS[u]
+            if not hmac.compare_digest(hpw(str(b.get("old", "")), r["salt"]), r["hash"]):
+                res = {"err": "Senha atual incorreta"}
+            elif len(str(b.get("new", ""))) < 6:
+                res = {"err": "Nova senha com no mínimo 6 caracteres"}
+            else:
+                r["salt"] = secrets.token_hex(16); r["hash"] = hpw(str(b["new"]), r["salt"]); save_users()
+        elif P == "/api/add":
+            if add_channel(b.get("url", ""), u) == "limit":
+                res = {"err": "Você atingiu o limite de canais da sua conta"}
+        elif P == "/api/remove":
+            remove_channel(b.get("url", ""), u)
+        elif P == "/api/settings":
+            for k in ("sens", "pre", "post", "cooldown", "vertical", "chat", "keep_ts", "outdir", "mode", "floor",
+                      "minscore", "sustain", "rename", "apikey"):
+                if k in b and not (k == "apikey" and not b[k]) and not (k == "outdir" and not own):
+                    CFG[k] = b[k]
+            save_users(); save_cfg()
+        elif P in ("/api/clip", "/api/pause"):
+            m = MON.get(b.get("url"))
+            if m and (own or m.owner == u):
+                if P == "/api/pause":
+                    m.paused = not m.paused
+                elif m.status == "gravando":
+                    threading.Thread(target=m.cut, args=(m.sec, "Manual", 30, 0), daemon=True).start()
+        elif P == "/api/fav":
+            p = user_file(b.get("rel", ""), u)
+            if p:
+                try:
+                    info = json.load(open(p[:-4] + ".json", encoding="utf-8"))
+                except Exception:
+                    info = {}
+                info["fav"] = not info.get("fav", False)
+                json.dump(info, open(p[:-4] + ".json", "w", encoding="utf-8"))
+                res = {"fav": info["fav"]}
+        elif P == "/api/posted":
+            p = user_file(b.get("rel", ""), u)
+            if p:
+                try:
+                    info = json.load(open(p[:-4] + ".json", encoding="utf-8"))
+                except Exception:
+                    info = {}
+                info["posted"] = not info.get("posted", False)
+                info["posted_at"] = time.time() if info["posted"] else None
+                json.dump(info, open(p[:-4] + ".json", "w", encoding="utf-8"))
+                res = {"posted": info["posted"]}
+        elif P == "/api/delete":
+            p = user_file(b.get("rel", ""), u)
+            if p:
+                for ext in (".mp4", ".json", ".jpg"):
+                    try:
+                        os.remove(p[:-4] + ext)
+                    except Exception:
+                        pass
+        elif P == "/api/clean":
+            cnt = 0
+            for x in list_clips():
+                if not x["fav"] and x.get("owner") in (u, None):
+                    p = os.path.join(CFG["outdir"], x["rel"])
+                    for ext in (".mp4", ".json", ".jpg"):
+                        try:
+                            os.remove(p[:-4] + ext); cnt += ext == ".mp4"
+                        except Exception:
+                            pass
+            res = {"n": cnt}
+        elif P == "/api/open" and own:
+            open_path(os.path.join(CFG["outdir"], b.get("sub", "")))
+        self.send(res)
+
+
+LOGO_B64 = "iVBORw0KGgoAAAANSUhEUgAAAvgAAADxCAMAAACJbDMwAAAAkFBMVEVeYF4gGSSfoJ5AQD7e4N5+gH2+wL7Awb6AgX5APj0+QD6Afn5gBb5/foC/wcDAv77Av8D9/f1yA/EHBwZzA/EVFRPo6OcVAy4zA24nJyYmA1JISEc3NzZnaGZWV1XX19ZRBq9kBdXIyMe2t7anqKeWlpV3d3WIiIdFBZJbBsg7BIYdA0WBBf3g4N5gYF4gIB5Hd6/YAAAAMHRSTlP//////////////////////////wD////////////////////////////////////cYJ/+AAAbO0lEQVR42u2dh3LruJKGafukmQ13FZjEIGZScjjv/3ZLUsGyxQCguwFSxF93p2pqxwIJfmh0NxqAscXXWksLVQSQGpp4rSXyb2jmtZZIv6Gh11oi/IamXmuJ7Buaeq0lsm9o7LWWiL6hqddaIvuGxl5riegbGnutJaJvaOy1loi+obHXWiL6hsZea4noG5p7rSWSb2jstZaIvqGx11oi+obmXmuJ5Buae60lkm9o7LWWiL6huddaIvmG5l5rieQbGnutJaJvaO61lki+obnXWiL5huZea4nkG5p7rSWSb2jutZZIvqG511oi+cY0uY/X8VWHVtFZVVU1/4ziqXRuPKL2bb68mtYEyDeIua+//BnXs47Ho/NFu7Psr9qMaXf92y8/06fXWl9b2B1ZRk9cHS9/b/dpsxl4XntnD6r7cZ0OHT97MYpOQ2pQb+s4Ou745XCoOjL9Z/VXb758dfMGcX+PO0dHRFVHl/CDj8B8VDm7cYDFZOL8zK4axCdynjaTVT1knOq/e5//La52m82UH7+6f+a32LFxf5MXfDD0zqR7/UZOP/ZzeAV753QaTxhBkp69unto+G8e2cg3CLg/HHf2Zj6yo+7XcObzBveGLrJn2PdHlN98PbCQb6BzX+02c1On0Z/Pa5i132c70TwHrYPd43VvRAzkI4MfOfZmhtrdv8nrnJ6/jXhu2HdmaHViG8sMmJujIPiijn01S+o7yd/N8jVeo9lxfyV/RzGa+sk30LiPndlif+/tOHN9jzpefKtm9syNfX5D7vFqjHwDi/tqztjX+uIXRjN+Eftoz6/v3yLS77kmAz+aOfY1L7c5QXvIl9ZC7/v+Hof8Jif4/NS/xWQesXmjJ7fVk0mDn4Pt6NTPqQcKo2NC4J2NBLgGgr13xgBw/U95rcJaRtCoaFS2yhs9Z63SRkmj/a2sHz/qf3rnH/b9ZiTc/bj32cZZp6Y+VYQdzxn3G3zXCMMvf9/qz+dTXx85Tf+T3Kg8/8D3B+jTx/WR21fw++RyjH7T61Xb0GdzX/Sv36+Xy//31MDT2Sbx6Jt9vv2Xv64L/b07k78eAx/VyzHdsMjTZG+tcHUGP1xZrQR+YW8OmIh78xOIPmly7gjsHrD2SZoXocvigPkrOjUGxN1bAip6nzcU+bnEHIlv19jg9662+UGGTvxX8IOV8O939NPmtT+VaUDB39N0hJXkoTtm8V0y7K1VO6OlIn+b9j5vJvJz5f3w3/GAz819j3fvlwmhnTnNsJsCF/yLr9OxkhIA26ECv6UvDYZNvmvRNZ6eZl6Rx/b73ASRvrLcQd+1g3wQ+G/dq21mQEn9LfgrVPCj3lwmFPzNnrQ/9rk/5OMTgt+6jGLDOujJmwkNo3w8ozkIPif3nclXt6T9yp/GokQG/9jrvIXQdogtwWqV9aNPOd2cvE6hD5H1gJ8DnN+hvM438g2Ao1N1Ym9Rf+PrvIYN/q43SRWCLKIM8Guj56oA/6dw+GyZeE+bstWhIIHfAYgpAftP8HMA+ANrHh3umzcD8FdW0EM+ZeMnu52iWWmxrg4Z1rAGwAdzH+xXMnShaQbgW3/lgV8bPlc6+KdvITQjdic0RQK3xGQDf40B/j33frpaSQU/AyAy0FEdBckv0MlJUtdYnaaPtHFfeGylaKO02IDAB3IfWJK4vw5weeD7MwG/mwHSxgNhO92ZgvQBhnAc/DUY/DvuzWwlTSn8gw6Bv8Nc/PTBYxSe2CNt/Fl8raBrehJJHJcbEPig5Vo/WWnwJwF+B/mkjSfibTzjLNv2LoXZQwftCIFf3ZdXSOT+mgFO4D/BCL744ucLOA6Hk0/a+NlhEQlvO1wUkWRmtgGBD+G+WK00+IM5O5ng35FP23i4EV699VDSZx4P+GsA+HfrteXqocB3CMCX20WFzO/TloeZQo3cO+cCY7S/2u2VBXyOvbWqub9YNMiKJCf4fy1xe6iij76GjX9oc2ynSgPfEvzTL56OgC0LNlwWfy0Mvq2aewXgm+/zAv9rprCgbqs1+SLhrQv3dPb9pak7VPB3yrm/zJCQctucE/w9EHzJUdDX+T+gbSs8gS8S3gbwYLHs34fjMIAvHNgGq8cB/5UA/EAN+F/c/A8pn0PETcnAS23WQEF29TZAPif4EVYRC8JHlQl+AgRfun24dXZC2qZScXP9zU8R+KLZwEaEeD0KvqiD7+5VgH+GyScC/4gJfqFqYsykWae9K26IPKj74DEdm9FBPh/4jswqkF59EIG/699FDAU/lN9LnrRp2RNfdf0DXLZN+A2+CPiR+sD2JmCEnB5QDoBfYdZ5/VEG/i8pxyzchqgCA+wLuOYPxFxmT07nK/isGXx7Ag7+p4XxiMCPMMEv1XXVNZnvExeUZOLz4pe8K791SEzWMwTvyOcB35G4pU0F+A4B+Lk68BMZxyx8aUggvA1Au237D+fpXrYVA38ijs614hHiPvxcAPhX35sa/GtKEZaV4Teklitk8K/gi2V0VDk6KOAXnOBnQPD/UdFPmSTwP802fzfdJDQ90c5lL1e4IZ8d/GoSGZ0bA/MxB/AzOfHloEE0qcG/1JCIGEMPsGw7tHiFBn6MdeIG2vcMiMA/YIKfyokvB9+SPBj7DUj7luJ/m4oafC7wHYlb9+nBDzjBfwaC7yoB/0LGXtIXMQWsdiJ+xGc4cEb4GwP4bFd4TqBG55tbWEgEX3gvR6IS/AuQ5EYqvFSK8b/nNTIORDnoMvhjt76zgz+VVObNC5dE4McE4Cvqr0BSOFYCOurjPGi4H3Igl+m8YYEfT8fgX1ctZgH+3lQJfiYJ/AywSnyOjJ94tzzsB3KZhzUW+NPx8D89V8hW0g9O8Mt5gn9uPZPUjtAgO/8td0KoFKlW4AU/nkwOHwl8Y+B03a6zz2cKfpvwMyUcbuIB7tDwhL6m6OLVJ/giOfx8CuBDPmfICf4fqC1UNEUGG1P05G1B15F/iBdCf5aLVStcyWcD/3sZ/rtK8DNi8LtOjRXOIP1QC34uCfwMMDmmQj6EJ7p4xQN+NJnFq9mBL/e45M6kkimhqurGyecOb60ngeEytHgVo4HvyDyTjnmSS2cBvuxTY++BNCXs+L3d+poKfAzuLW6hwM4rfvDt6STxZYD/ingJ1gV8VbbCb7Lk5Mln67ZDQ4EPyjtNDBXiH9DAn8QO8/s8FgR8b8g3RAXfVwt+KAX8L7Emt11M+GfUocWrNZqr40ylEP8r+AkV+DvES7AuFYSCxT779t70/HyBesY/1QaQp8/qdk+XuPdewH6Rf7OhpOTvI04jZrlAg1+DL3B2WjoJ8M1ZgS+YWPl2eobppSKdFcKenVfcBTsBb+F0Dlm8Omkc/LfDZlIuPgr4/wyte0wI/BTqdOUQ39TbmELk875sHuKNyAgP/ArtlgQcYVSZ+5zgi4c1L8jgc5KfQfZ/eWIWn7u3rATcKzyLV4zg33FgKAY/mBX4sHPCU+j+3xRiqkJB8KlXLcL+mShCBN+eVmx7Af9pCeD/3gDdrgSy/0sYfNqFg4Fcpr3GA/8g9Uol9s/h/qAC38G8BAt2TnjXSWFckWC7pCq6DcYQBZ92383AKVJHPPDvXHzVSZ2LDQV1rssLPvRmiAIPfK4PAAI/EAWf1DjuMQw+g8V30A5QXST4HzDwTWDSZP8ECIcKYfAp1zhLYLUCK/g7tdlMq9Z+n6RpludlUQRhaMKTSxYv+OKjDHZO+B4K/rurBHzC8HZo8SrGBN+W6b+1kCdplp0g9zzfdV3T7Pr8MwG/AKXCOsF/5n1TBeDThbcZisEfB/+AN+t/M+Q/9ifIn/PyZxG0lPt9lN9HeKDZVD74gitg7y7Qxz+BL2h/0zDo1aWSIZQd3nrwxSsm8CNk9y0vjDD0XjgY7wE/JAO/62YI4RRSCQK/60G5bqI7/QBhWHbZcCArvE0QFq/EwA+pnlsm+E9D4HcckC8e2MDOCe8Cn+vFT9WhhIm4vkuoqMLbAMfgj4N/RKvQPc2eGxMJfMgCsmUO1fUhg28CHLMOrPj8FnLwV/9KDW9xcpks4Du4YUu2wRJkAL7LAz+HRSQ+0Ic4gU+ZVvekhrclbKstBHzYzuV8EuDvJYO/QQPfFapcp9xtHshcvR3IZdoxLvg73KilRAO/IAO/65xwKPjCdWLujfwwtwTelHa3eYFVnCxv8YoJ/FfcioVipuALe6zAA/Kb9Tvr9E9LxIQmLfh/CMEvJa7ewndesYNv4wYtARr4JRn4BwLw3ZUapRvqYxZyiau3OZrB5wcfWLEQTgL8RD74lhrwTydKUe42f5a4eou0eMUCfowcs3ho4ENcyGQjDfxULfgFOfiZvOLkX0iLV0LgAysWfDTwM6ngp0DwnxSBH4IX+xhfUEZ4G+AZ/FHwD8ghyxzAjzHB/wWtecDob8oq4URacXJfdQT34hUL+MgVC0NhOacg2aXf8iy+2itRRA+fBycKKMLbHGvxSgj84BHAT+VZfLXgp/QHYwx9UtzYwkc0+KPgV7ih+t5EAz8hAx/1vk+14JcSwB/wXlHfOsPYassMvoOZRRw+7FM5+PGAxc+AQ13Rhk1PwirCUKLuf+S0E0sAH1axkKBxb9KBv8ZMUCi9EmUvfAsn0tIMYsMp3uIVC/g73IqFFA/8PfpjRHF0iKIqOlKAr+RsivxcBG5Sgh/IOW4hQKtWEAIfOGVnUwafZJ34sudFCfihjAMCCinHLQxEh7s1AfjIFQv5NMDPJIKv8EqUKyyk4OdSjlsoERevRMAHOm14xZnuzMBXcf5cKeG0j7HORMpoDhXir2cAPl5xJuhB+MH/KdyWQvBdKeCndN+J6YtVbwTg35fq0GUA+Lbcgjr0WWL1v7q7gDKslMSwftGVlrDkMsUM/hj42KU6eOCDiuVy+eAruBPbkwP+yNoMSniboC5eMYB/V7FgUA3cUdRN03V93/MQThAUAD+YH/gpSVaxI4R2N+ThLXIucxx85IoFjuLMmvOa8jAoijLPszTZ78+78M7d/EKUIkAH3wNGxyh9TQn+WP0Vwn6UgVymsyYB/4hbsTDQR61Bb0kva85b0Lv74C/CDMoPvjE78PPbE4xyWSOs68vCw1vsXOY4+HcVC88w8D+/xclxOVn0rLHojHupL4NfMvghFPz/UpXDpwd/zH8FNz5QB/e6lgQ+MErKg7Pn0mvRWT9oSAv+JaTwwc2FaBM+J40m2kQNzFiAw9sM3+CPgb+j3zkvmEP4gPxIuxO1ZbuGu3Gwwub43+YW5ayefdL/TU4hxWkeN1HAD+R2U0m975tncSYhG1n2mgj8V9xSHcTEFgikfRND7JkOq/GgFj9AGKigjA75sCvoMgNj+dKKCnwbs1AA9ZPKch0QwDfBrhk4C0La+mhyGFznYqIb/BHwY6nXoUwZfA/62WSCf59Zp9x0y1AAAgpvB1KBDhn4UjuQq5fLuYBfnsD3VHJP2/p4kTfVamNMBf5hI3PK5AI/nw/4kk1G4iKTxxp2ERXs+BQGfwR85DMWFgl+Lhn8rPOmPEoXleEEAcDbp+jVCiLgF8rBz89FarKqHUOoycwl2NzRFAvtVZUMZ8Yk0A+AuXg1Dn6FW7GwSPAzmeD/9jfTBF/YVRjIZUZk4L8dqU9DFHWZTWlb+eYEvlVsejJ/pHsPLYbSQ+GCnYJg8WocfOTDRfCmcnngB1BuU1ngW7kr52SnvjiIxNfxsAvxmVydu4qFXxMBX94ScnDe8AUFn3oFZP/TlbHnm9MNhz9A72/bsUTwzf3iwC+gOx0TGV52+mHS7wYZmxVJjjoNKHKZo+Db+KXV8E42pQ7B4nRP7YTB32cfLhl3QD8c/gA/CRav+MFXX7GwMlSAD3nzhOgwM8uy9ulzEfpMx5EKcpdmadah9Eb1v4WE4OeYp0ixgh9LXQdh9flaCyxt7jlXHLjvwgbZBHmJZVjLu5fvu+b1vCiqpVPEU91F0yLPFLlMfvBXEwBf7txzBv9pDwRf9KZcpEvDctXgiybCM4LFq1HwowmC70kHHxjWXzYJJ6IDHeVk9VI1+KJLn79oDP78wH+RDH4OzSJd4BEGH0XFXMHvLgSy16TgVxP08X3JT4IGvmB096EUfLy7+gpg92EuXo2Cf9xMLqtz+RTS5h7V4COdNhqoBj/ABB9u8IfBv6tY+KsefFd2lS84EQ47PBMJ/BD07OoeoPsRdrLBV79yuzjwC6XceerB9yhyOrzgq7nXoyvWCWcHvmA+r8ThzlMNvrCl6kpryQf/eXHgp2DwvSmA74tShyXhoKyYgo+vfgfWBfxANvgZFPxy4eBbswZf+WbzRPYIhIMfgsBHujVMMB83gRtsSoIKNX7wleczf6kCX9zJM0BPjAT+39mCn2FvM2cC35za2Zmp7M2/CXjTZTAF8AXzcXiX9ZkzBz+fCPjSnuMSVIDBF4xKnpWCX6oHP50G+Kqd/EwV+OJTTAECH+lKbMGV5wncS5yQ1Khxg6/ayX9WA745d/A3qsEXLcvurlIjBv/YsXageAkrl33cg/UXBXxTdK7EAj9V2jogOuwEn7hIreoAP5gG+NLG36lGwgSkkcrTnjFB8NOlg99ZpUYMfoSZlsJROVvwPbXgZ0pbh3wxH/+IhQb8Lc/WQ/VVC5f82v/NB/z8BP4/GnwxeRTlmdth8O374FzxEfmyj9W5gh/AwBcuGvitdM8rIvjCUVlIUZ45DP7aRh26GAqkg+9DY5sMdEBJIsDYDm3rXyIGuWMjgh9QFOuMgP/akY9Vm8oPpG8M8KELGCkI/D33XvNd/NbBndg9u4nQTveq6wGEE9A/FYDfZTpMpSfHhpLPk7peGAsBfyMR/N1h/dY1UxeShl0NZdT5AMLglwrAd3ArTPHAf5IJPnDL1wX8H0J//c6Dnn2M+1zUQBb4To+rILwQklOUZ46AH+EeFYFnfyUmVcHgJyDvjP2Ej1cnGnBRQ+LWL9hHfa6CMDQkVWo1+Nz5TKVbb2WfJ4VwMwQ9+La9c6LDsItKD7796lRx38UKgEJyiiq17Qj43Wkdlbd+/iPd2wqhLe7xwbd3FzlOFcUxQ2zm4bX+GkeHRnGtQ3RW/a/DPnIBNByoxTqj4DubiTk7so/VwQAfdGqs1b1wGa85kxIeqL95k+gOVpCxoqlSGwW/Ql+OwMmqe9LBdxWBL7Ri/1Dgd846FTH4MXJ9N1Q/3PmBb5mgKi0R8B203eaeWC7xiHiwTuecd0QAX8TJr0FQEuBKP10EA3x3eeBXiOATVKltx8E/4p8XgQG+MUPwBUs9XgRqtKrOqlpLKfjik7SnAvxo4KSUd/ngJ7KP1bmC/7QXAKe5rmefTAL8Jwvy9rzgR5jgh+jlmQzg9/s6tRGR7+enG1Xgm+/fkbas932jJPnd3ASV53lZ/imKIgiM0+09vu+7rvt0SUqU9X+ZtP9xc6/Uc96qbFScFVz0EV7keaZAeNmVk/C/3CQU3so4tXp+ip/tM5Xt0+VdboZ9kAt+gF6eeQZ/y7nv9jPClV6bL/08qU/wixbRIGhp/Ldl+q/ZaCNfNj93mK2Pg3+4/6sX4S9QYIO/ZQH/MHgVTSDN0a+dhiRNCzLwW6+kMd+NQX7OG8aNsLHaKsDejAwnteAzLJt2ZAPdLE3rCa/u47qruT4NepUaE/hddR+3r5OS057VDIbezSV/kAU06+R2JyfnpPEyGht+9kqG7bca4/4w4F/60Kw72m/8rsbDKorapcqytBkQVt+AyMnA30I6McTOa9auc017fk87x8px434nJ+t94rvF+8Q3m3syIcz5P/uBtnmGZVObf44z2wERhvVwqCOMdn6op4f3984qNRvIPQP4o+9gBnD0Gyt8Nu3/1GiOTvv52XSf8W7pLs7W23thx3umsmMxgzth8Humh2Y0uMh1yazgH8efMEjETHtj2cviw/O/wz4m9+qbbBapRYAP6QFG8IfLFlhewssTVtue/E7zcsiP0QJ/dvvhwY9g3LOAz2Lym//zitTqjVH3vxrbrmmXFF7Scnd8HPDhJv/kgXhBniZtvqpxwRvfW9v2RYK/o+6BCsY9E/j9xck9MUmTsHJ53Xat2bg6DOC/PgT49BOXFmo6k5i7aALgH5HA36pcENHi1E6tp3GYgKvjwLhnBL93C6KWEjlv/BtBEOcbhlSio3zss4I/TH6snZ0padTXiBQz93acKPhbTvC1szMrF582KmNw8d+i+YCvnZ35eDpCm14lDjsJ+RAHxj07+PThihZicEnom7IhR53WOeKBv11rN/9RDD6hybfZqmSonfwIxj0H+NS1rlq45FGZXMaVo3gSncAG/natA9xHSOmQksccVNIGhTsg91zgc5YuaKm0uER2imMDiD2B0c8Ivib/Yew9Efk8Hgalg2BDuf8G/lZ1yKI18sG5LN0B2+i+cnnWhGaygnLPC74mX20+h/dYeFxHmzd3TgbL6xob/K3SCUxrOKATcGxjx1Y26uhgOYC55wd/Hel8vgIXZ3e9bYSfvuPO7hFH+2LNH0hgidb44DOQH+s1XA5iW+129pd/b/W6u7nXpFV1UfSp090jawLFVzUttO3ctPv5LPX/ABfvHPHRrxC4vwd/K91zfBjALwwfL+ieufqGGQnFE1bk2JOz913gs5C/PHfn1ka31vl4scsHOpv8OOxXx+Ox7rS68155PKyuD3FA4V4Q/Ac3+vbFfl/N90HDi+tknbwppx0MHEPBFtxqywQ+G/mPYfTPhDeAn034YYneyARGwmUsHNt5YffUMRrsneiZIls28NnIl5fSP7HZcFn3zg5swy/R40EDPvXRcIiuo6GKxD/WlhV8RvJjhxr35n2/v/BYrHRnxE83smqQFqstNvjr9QE/WdVCe2zs8VCeYNdOhDdm3LlArhnXEgd/y/6rFUpW335qrHsVsWdHmolQI64lyH0f+Bzkrw+ieVq7wf3Yuu7682hJ5b4X/C3Xj0dHdrvfZMMdTbuWUu77wd9yNhA3jvdwpNoYd+2eaE2B+wHwtwLNHKLKcW5Lok6JmYO27lrT4n4I/K1wc5pzrYlzPwj+Vvec1oNyPwy+Jl/rQbkfAV+Tr/WY3I+Br8nXekjuR8HX5Gs9Ivfj4GvytR6QewbwNfpaD4c9G/iafK1H454NfE2+1oNxzwi+Rl/robBnB1+Tr/VI3LODr8nXeiDuOcDX6Gs9DPZ84Gv0tR4Ee17wNflaj8E9L/gafa1HwF4AfI2+1vyxFwJfo681d+wFwdfoa80be2HwNfpac8YeAL5mX2u21APB1+hrzRR7KPiafa05Uo8BvmZfa3bUI4Gv4deaFfSY4Gv6tebCPD74mn+tyRN/1v8Dr4oxeNOxpkEAAAAASUVORK5CYII="
+FAV_B64 = "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAMAAAD04JH5AAAAYFBMVEWfn55HBJR1dXRcBMY+BIIhEDHBwb/f4N8eBER/gX5/gIGBgX9yA/D9/f0HBwZyBPAWFRXo6OcmBU5TBLAXBS0oKCc1NTXX19ZkBNTGxsY0BG9ISEdnZ2ZXV1aHh4a1trWPumAiAAAAIHRSTlP///////////////////8A/////////////////////2nkwi4AAAP9SURBVHjazZuLgqMgDEWj7ezsozCiKL79/7/cYkdrp1ZDAOn9gN4jYkhSAl/bulhrxwB8emMo4AD3TQY4yP4lAhxm/wIBDrRfRYBj/Z8J4GD/JwI42P4JAY73fySAAP4PBBDCf0kAQfwXBBDG/07gC6C865TdtA1gbpFFdZ1O+pAL8XWtLwGQ/LM65cZafwlg7l/WklO0vg2MAbKUE7UBYGAvOXcGcDEGKFFPn3zrIx9VjMq3ALD+50efpu1h1KBVjVKjPsVNbKGCrwcDA4DfC/eirx5+fl8bADj7aGHfVsxYqwAXPEC2sFeMoNwO4P78HcmeidcAZv7AaBIJXz+TUADz+ucV0Z8pbgEw+zeChQAo59fPWBCAKfo2Fv6segmw6z+F30LYAPx6AXAB7AeQKBt/NlABStvv71tABZheQMvCAExfYCICAUg3L4AMMO3A3Naf9TQA7moBWEwCmBdAWAO0JIBpB8TMAUBiDjAfQpU9QEcBqJ1tQSKAdBSEtBrCHsjcfQM0gLPDLUACSF2F4VtWbg4gHe5BlpsDzAdxQUuDhVDVr2EA6P/EbcfNAe6p6L7Zp1JVpc2gj69uTXOtRpNktzreBojQuWj18WSGK8+3AaYwtB+IgdofQAL0gQBSdBzqPQMMiLPeB4BEB8LWL8B+QdD5AeDoSNx4AZgD4X4+VngBOOEjsR8AfCQWiV+A3Uis/ADMR8FuQqYwzVNzAHwkrlYM87xoujbuewDdQ1WtBQAgAJLkajg6joZKiJVgaQiAPwqYejZcC5aGABJ9FODKAjqACgzgJCceo7UZgEEk9gxQuPAfo7UZgEFO7BmgCwSAj8TYwsgQ4OwUQJgD1G4BzA+j9G0AnGxCZQHgJA7olCEhAiQuzoLKAsDJaWgF8NcBwKAPFSpAEwagvid4DjaBLuALYihGZKVeABZ/VjvICIAnvCEDOFiC3hygXGb5ygVAR01KXYRjDdBSCxMXL0HXJaYA2UOtZRkOdV0SUxsUt21g1zHXZUFP7pLdCOBwgOxHxUv750qoagDQGRmQ2/VzQBrMXHXXusjn7oU5QP1U9jew1Z5XujV/M13rmTTGAOXKr+TxIB5dq9mV2KL5MlmCcTsWXdz3/T+c6x7A9h0S7lQEgCw0wCUNDXCRBwBsEpw8A+zfpstCAzgkeAlwFAH5TulJ+gbYvc+WegLA3yuOPAMg7hQSF0F+pGl9jiJpf7f8ZIAgZVrXUZadyvtWrtMtANTN1jKSe0/703ZTlAGH0zmVTw+b1lF0dUXa/vAnjHiUWXSutc4R+mFf+7/RkEvwMZ/wg07hR73CD7uFH/cLP/D4BiOf4Ydew4/9vsHg8xuMfr/B8Pth4///AcHxQ24eNcLKAAAAAElFTkSuQmCC"
+
+
+def main():
+    print("streamlink:", " ".join(SL) if SL else "NÃO ENCONTRADO")
+    print("ffmpeg:", shutil.which("ffmpeg") or "NÃO ENCONTRADO")
+    load_users()
+    for k, r in USERS.items():
+        if r.get("active", True):
+            start_user(k)
+    host = "0.0.0.0" if "--lan" in sys.argv else "127.0.0.1"
+    srv = ThreadingHTTPServer((host, PORT), H)
+    if host == "0.0.0.0":
+        try:
+            print(f"Modo rede local: outras pessoas acessam em http://{socket.gethostbyname(socket.gethostname())}:{PORT}")
+        except Exception:
+            pass
+    if ADMIN_NAME not in USERS:
+        print(f"Primeiro acesso: abra o painel e crie a conta do administrador ({ADMIN_NAME}).")
+    print(f"Clipfy rodando em http://localhost:{PORT}  (Ctrl+C para sair)")
+    print(f"Arquivos salvos em: {CFG['outdir']}")
+    threading.Timer(1, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for m in MON.values():
+            m.stop_flag.set(); m.stop_proc()
+
+
+if __name__ == "__main__":
+    main()
